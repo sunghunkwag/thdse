@@ -11,8 +11,10 @@ class TopologicalASTGraphCA:
         h = int(hashlib.md5(node_type.encode('utf-8')).hexdigest()[:8], 16)
         return float(h % 10000) / 10000.0 * 2 * np.pi
 
-    def code_to_graph(self, code: str) -> nx.DiGraph:
-        tree = ast.parse(code)
+    def code_to_graph(self, code: str = None, tree: ast.AST = None) -> nx.DiGraph:
+        if tree is None:
+            tree = ast.parse(code)
+        
         G = nx.DiGraph()
         
         def traverse(node, parent_id=None, depth=0, sibling_index=0):

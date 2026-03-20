@@ -10,10 +10,57 @@ except ImportError:
     print("Warning: hdc_core not found. Ensure the Rust module is compiled and available in PYTHONPATH.")
     hdc_core = None
 
-from src.topology.encoder import TopologicalEncoder
-from src.axioms.engine import AutoAxiomatizationEngine
+from src.topology.encoder_v2 import TopologicalEncoderV2
+from src.axioms.engine_v2 import AutoAxiomatizationEngineV2
 from src.prophet.gnn_analyzer import TheProphet
-from src.swarm.orchestrator import AutophagicSwarmOrchestrator
+from src.swarm.orchestrator_v2 import ResonanceGuidedOrchestrator
+
+# ── Known bug pairs for axiom seeding ────────────────────────────
+
+SEED_PAIRS = [
+    # (buggy, fixed) — infinite loop
+    (
+        """\
+def process(data):
+    x = 10
+    while x > 0:
+        pass
+    return x
+""",
+        """\
+def process(data):
+    x = 10
+    while x > 0:
+        x -= 1
+    return x
+""",
+    ),
+    # (buggy, fixed) — off-by-one
+    (
+        """\
+def get_last(lst):
+    return lst[len(lst)]
+""",
+        """\
+def get_last(lst):
+    return lst[len(lst) - 1]
+""",
+    ),
+    # (buggy, fixed) — None dereference
+    (
+        """\
+def get_name(user):
+    return user.name.upper()
+""",
+        """\
+def get_name(user):
+    if user is not None:
+        return user.name.upper()
+    return None
+""",
+    ),
+]
+
 
 async def bootstrap_thdse():
     if hdc_core is None:
@@ -21,13 +68,20 @@ async def bootstrap_thdse():
         return
 
     arena = hdc_core.FhrrArena(100000, 10000)
-    encoder = TopologicalEncoder(arena, 10000)
-    axiom_engine = AutoAxiomatizationEngine(encoder)
+    encoder = TopologicalEncoderV2(arena, 10000)
+    axiom_engine = AutoAxiomatizationEngineV2(encoder)
     prophet = TheProphet(in_channels=16, hidden_channels=32)
-    
-    orchestrator = AutophagicSwarmOrchestrator(encoder, axiom_engine, prophet)
-    
-    target_code = """
+
+    # Seed axiom DB with known bug patterns
+    print("Seeding axiom DB with known bug pairs...")
+    added = axiom_engine.ingest_batch(SEED_PAIRS)
+    print(f"  {added} axiom(s) registered from {len(SEED_PAIRS)} pairs.")
+    counts = axiom_engine.db.count_by_source()
+    print(f"  Axiom sources: {counts}")
+
+    orchestrator = ResonanceGuidedOrchestrator(encoder, axiom_engine, prophet)
+
+    target_code = """\
 def process(data):
     x = 10
     while x > 0:
@@ -35,13 +89,14 @@ def process(data):
     return x
 """
 
-    print("Executing Topological Autophagy Epoch...")
+    print("Executing Resonance-Guided Autophagy Epoch...")
     try:
         resolved_code = await orchestrator.execute_pipeline(target_code)
-        print("Mathematical Synthesis State Reached:\n")
+        print("Synthesis complete:\n")
         print(resolved_code)
     except Exception as e:
-        print(f"Pipeline Interruption: {e}")
+        print(f"Pipeline interruption: {e}")
+
 
 if __name__ == "__main__":
     asyncio.run(bootstrap_thdse())
