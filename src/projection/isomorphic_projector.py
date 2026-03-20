@@ -20,7 +20,7 @@ import networkx as nx
 import numpy as np
 
 from src.topology.multi_layer_builder import MultiLayerGraphBuilder
-from src.utils.arena_ops import bind_phases, bundle_phases, negate_phases
+from src.utils.arena_ops import bind_phases, bundle_phases, negate_phases, bind_bundle_fusion_phases
 
 
 @dataclass
@@ -355,3 +355,48 @@ class IsomorphicProjector:
     def project_graph(self, G: nx.DiGraph) -> 'LayeredProjection':
         """Project a pre-built, pre-evolved graph."""
         return self._project_from_graph(G)
+
+    # ── Contradiction Vector Synthesis ────────────────────────────
+
+    def synthesize_contradiction_vector(
+        self, atom_handles: List[int],
+    ) -> int:
+        """Synthesize a single Contradiction Vector (V_error) from UNSAT core atoms.
+
+        Given the arena handles of the conflicting structural atoms isolated
+        from the Z3 UNSAT core, algebraically combine them:
+
+          V_error = bind(atom₁, bind(atom₂, ... bundle([remaining atoms]) ...))
+
+        For a single atom:    V_error = atom
+        For two atoms:        V_error = bind(atom₁, atom₂)
+        For three+ atoms:     V_error = bind(atom₁, bundle([atom₂, ..., atomₖ]))
+
+        This encodes the exact topological defect as a single hypervector
+        whose direction in the FHRR space represents the axis of contradiction.
+
+        Args:
+            atom_handles: Arena handles of conflicting structural atoms from
+                         the UNSAT core (reverse-mapped from Z3 constraint labels).
+
+        Returns:
+            Arena handle of the synthesized V_error.
+        """
+        if not atom_handles:
+            raise ValueError("Cannot synthesize contradiction vector from empty handle list")
+
+        if len(atom_handles) == 1:
+            return atom_handles[0]
+
+        if len(atom_handles) == 2:
+            v_error = self.arena.allocate()
+            self.arena.bind(atom_handles[0], atom_handles[1], v_error)
+            return v_error
+
+        # For 3+ atoms: V_error = bind(atom₁, bundle([atom₂, ..., atomₖ]))
+        # This uses the fusion operator: fuse(A, {B₁,...,Bₖ}) = A ⊗ (B₁ ⊕ ... ⊕ Bₖ)
+        v_error = self.arena.allocate()
+        self.arena.bind_bundle_fusion(
+            atom_handles[0], atom_handles[1:], v_error,
+        )
+        return v_error
