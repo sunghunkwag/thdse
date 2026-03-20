@@ -1,0 +1,37 @@
+warning: virtual workspace defaulting to `resolver = "1"` despite one or more workspace members being on edition 2021 which implies `resolver = "2"`
+  |
+  = note: to keep the current resolver, specify `workspace.resolver = "1"` in the workspace root's manifest
+  = note: to use the edition 2021 resolver, specify `workspace.resolver = "2"` in the workspace root's manifest
+  = note: for more details see https://doc.rust-lang.org/cargo/reference/resolver.html#resolver-versions
+   Compiling hdc_core v0.1.0 (C:\Users\starg\OneDrive\바탕 화면\thdse\src\hdc_core)
+error[E0277]: the trait bound `&[usize]: PyFunctionArgument<'_, '_>` is not satisfied
+   --> src\hdc_core\src\lib.rs:215:41
+    |
+215 |     fn validate_handles(&self, handles: &[usize]) -> PyResult<()> {
+    |                                         ^ the trait `PyClass` is not implemented for `&[usize]`
+    |
+    = help: the trait `PyClass` is implemented for `FhrrArena`
+    = note: required for `&[usize]` to implement `FromPyObject<'_>`
+    = note: required for `&[usize]` to implement `PyFunctionArgument<'_, '_>`
+note: required by a bound in `extract_argument`
+   --> C:\Users\starg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\pyo3-0.18.3\src\impl_\extract_argument.rs:86:8
+    |
+ 80 | pub fn extract_argument<'a, 'py, T>(
+    |        ---------------- required by a bound in this function
+...
+ 86 |     T: PyFunctionArgument<'a, 'py>,
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `extract_argument`
+
+warning: variable does not need to be mutable
+   --> src\hdc_core\src\lib.rs:152:13
+    |
+152 |         let mut p_out = p_buf.add(out_handle * floats);
+    |             ----^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+For more information about this error, try `rustc --explain E0277`.
+warning: `hdc_core` (lib) generated 1 warning
+error: could not compile `hdc_core` (lib) due to 1 previous error; 1 warning emitted
