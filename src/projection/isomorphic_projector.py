@@ -7,28 +7,47 @@ Mathematical contract:
   - Data-dependency sets    →  bundle (⊕)       (preserves membership, order-invariant)
   - AST structural identity →  bind (type ⊗ position ⊗ CA-state)
 
-The output is a single arena handle representing the entire code's topological
-fingerprint in the complex hyperdimensional space.
+The output is a LayeredProjection containing per-layer handles AND phase arrays,
+enabling algebraic unbinding (conjugate) for layer-aware decoding.
 """
 
 import hashlib
 import math
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
 
 import networkx as nx
 import numpy as np
 
 from src.topology.multi_layer_builder import MultiLayerGraphBuilder
+from src.utils.arena_ops import bind_phases, bundle_phases, negate_phases
+
+
+@dataclass
+class LayeredProjection:
+    """Result of projecting code into the VSA arena, with per-layer decomposition.
+
+    Stores both arena handles and the corresponding phase arrays so that
+    the decoder can reconstruct conjugates for algebraic unbinding.
+    """
+    final_handle: int                           # ast ⊗ cfg ⊗ data (backward compatible)
+    ast_handle: int                             # ast_bundle before cross-layer bind
+    cfg_handle: Optional[int]                   # cfg_bundle (None if no CFG edges)
+    data_handle: Optional[int]                  # data_bundle (None if no data-dep edges)
+    ast_phases: List[float] = field(default_factory=list)    # phase array of ast_bundle
+    cfg_phases: Optional[List[float]] = None    # phase array of cfg_bundle
+    data_phases: Optional[List[float]] = None   # phase array of data_bundle
 
 
 class IsomorphicProjector:
-    """Projects a multi-layer code graph into a single FHRR hypervector."""
+    """Projects a multi-layer code graph into a LayeredProjection."""
 
     def __init__(self, arena: Any, dimension: int, ca_steps: int = 5):
         self.arena = arena
         self.dimension = dimension
         self.builder = MultiLayerGraphBuilder(steps=ca_steps)
         self._seed_cache: Dict[str, int] = {}
+        self._phase_cache: Dict[str, List[float]] = {}
 
     # ── Deterministic phase generation ───────────────────────────
 
@@ -38,7 +57,6 @@ class IsomorphicProjector:
         phases = []
         state = seed & 0xFFFFFFFF
         for _ in range(self.dimension):
-            # Knuth LCG with md5 mixing every 64 steps for diffusion
             state = (state * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFFFFFF
             phase = ((state >> 33) / (2**31)) * 2.0 * math.pi - math.pi
             phases.append(phase)
@@ -48,10 +66,16 @@ class IsomorphicProjector:
         """Allocate and inject a deterministic hypervector, cached by key."""
         if cache_key not in self._seed_cache:
             seed = int(hashlib.md5(cache_key.encode("utf-8")).hexdigest()[:8], 16)
+            phases = self._deterministic_phases(seed)
             handle = self.arena.allocate()
-            self.arena.inject_phases(handle, self._deterministic_phases(seed))
+            self.arena.inject_phases(handle, phases)
             self._seed_cache[cache_key] = handle
+            self._phase_cache[cache_key] = phases
         return self._seed_cache[cache_key]
+
+    def _get_phases(self, cache_key: str) -> List[float]:
+        """Retrieve the phase array for a cached key."""
+        return self._phase_cache[cache_key]
 
     # ── Node-level projection ────────────────────────────────────
 
@@ -64,47 +88,58 @@ class IsomorphicProjector:
         type_h = self._get_or_create_handle(f"type:{node_type}")
         pos_h = self._get_or_create_handle(f"pos:{depth}:{sibling_idx}")
 
-        # CA state → uniform phase injection
         ca_phase = float(np.angle(data["state"]))
         state_h = self.arena.allocate()
         self.arena.inject_phases(state_h, [ca_phase] * self.dimension)
 
-        # type ⊗ pos
         tmp = self.arena.allocate()
         self.arena.bind(type_h, pos_h, tmp)
 
-        # (type ⊗ pos) ⊗ ca_state
         node_h = self.arena.allocate()
         self.arena.bind(tmp, state_h, node_h)
         return node_h
 
+    def _project_node_phases(self, data: dict) -> List[float]:
+        """Compute the phase array for a projected node (parallel to arena ops).
+
+        node_phases = type_phases + pos_phases + state_phases  (element-wise)
+        """
+        node_type = data["type"]
+        depth = data.get("depth", 0)
+        sibling_idx = data.get("sibling_index", 0)
+
+        # Ensure handles exist (populates phase cache)
+        self._get_or_create_handle(f"type:{node_type}")
+        self._get_or_create_handle(f"pos:{depth}:{sibling_idx}")
+
+        type_phases = self._get_phases(f"type:{node_type}")
+        pos_phases = self._get_phases(f"pos:{depth}:{sibling_idx}")
+
+        ca_phase = float(np.angle(data["state"]))
+        state_phases = [ca_phase] * self.dimension
+
+        # bind is phase addition: type ⊗ pos ⊗ state
+        return bind_phases(bind_phases(type_phases, pos_phases), state_phases)
+
     # ── Layer-specific edge projections ──────────────────────────
 
     def _project_cfg_chains(self, G: nx.DiGraph, node_handles: Dict[int, int]) -> List[int]:
-        """CFG edges encode ordering → chain-bind along each maximal CFG path.
-
-        For a path [n0 → n1 → n2], the encoding is:
-            role_cfg ⊗ H(n0) ⊗ H(n1) ⊗ H(n2)
-        This preserves the sequential ordering of control flow.
-        """
+        """CFG edges encode ordering → chain-bind along each maximal CFG path."""
         role_cfg = self._get_or_create_handle("role:cfg")
 
-        # Extract CFG-only subgraph
         cfg_edges = [
             (u, v) for u, v, d in G.edges(data=True)
             if d.get("layer") == MultiLayerGraphBuilder.EDGE_CFG
         ]
         cfg_sub = nx.DiGraph(cfg_edges)
 
-        # Find maximal paths (start from nodes with in-degree 0 in CFG subgraph)
         chain_handles = []
         sources = [n for n in cfg_sub.nodes() if cfg_sub.in_degree(n) == 0]
         if not sources:
-            sources = list(cfg_sub.nodes())[:1]  # cycle: pick arbitrary start
+            sources = list(cfg_sub.nodes())[:1]
 
         visited_edges = set()
         for src in sources:
-            # Walk forward greedily
             path = [src]
             current = src
             while True:
@@ -120,7 +155,6 @@ class IsomorphicProjector:
             if len(path) < 2:
                 continue
 
-            # Chain-bind: role ⊗ h0 ⊗ h1 ⊗ ... ⊗ hN
             chain_h = self.arena.allocate()
             first_node = path[0]
             if first_node in node_handles:
@@ -139,12 +173,57 @@ class IsomorphicProjector:
 
         return chain_handles
 
-    def _project_data_dep_sets(self, G: nx.DiGraph, node_handles: Dict[int, int]) -> List[int]:
-        """Data-dep edges encode unordered def-use relationships → bundle per node.
+    def _project_cfg_chain_phases(
+        self, G: nx.DiGraph, node_phase_map: Dict[int, List[float]]
+    ) -> List[List[float]]:
+        """Compute phase arrays for CFG chains (parallel to arena ops)."""
+        self._get_or_create_handle("role:cfg")
+        role_phases = self._get_phases("role:cfg")
 
-        For each node with data-dep neighbors {d1, d2, ...}:
-            role_data ⊗ bundle(H(d1), H(d2), ...)
-        """
+        cfg_edges = [
+            (u, v) for u, v, d in G.edges(data=True)
+            if d.get("layer") == MultiLayerGraphBuilder.EDGE_CFG
+        ]
+        cfg_sub = nx.DiGraph(cfg_edges)
+
+        chain_phase_arrays = []
+        sources = [n for n in cfg_sub.nodes() if cfg_sub.in_degree(n) == 0]
+        if not sources:
+            sources = list(cfg_sub.nodes())[:1]
+
+        visited_edges = set()
+        for src in sources:
+            path = [src]
+            current = src
+            while True:
+                succs = [s for s in cfg_sub.successors(current)
+                         if (current, s) not in visited_edges]
+                if not succs:
+                    break
+                nxt = succs[0]
+                visited_edges.add((current, nxt))
+                path.append(nxt)
+                current = nxt
+
+            if len(path) < 2:
+                continue
+
+            first_node = path[0]
+            if first_node not in node_phase_map:
+                continue
+
+            chain_p = bind_phases(role_phases, node_phase_map[first_node])
+            for step_node in path[1:]:
+                if step_node not in node_phase_map:
+                    continue
+                chain_p = bind_phases(chain_p, node_phase_map[step_node])
+
+            chain_phase_arrays.append(chain_p)
+
+        return chain_phase_arrays
+
+    def _project_data_dep_sets(self, G: nx.DiGraph, node_handles: Dict[int, int]) -> List[int]:
+        """Data-dep edges → bundle per node, then bind with role."""
         role_data = self._get_or_create_handle("role:data_dep")
 
         dep_handles = []
@@ -170,45 +249,89 @@ class IsomorphicProjector:
 
         return dep_handles
 
+    def _project_data_dep_phases(
+        self, G: nx.DiGraph, node_phase_map: Dict[int, List[float]]
+    ) -> List[List[float]]:
+        """Compute phase arrays for data-dep projections (parallel to arena ops)."""
+        self._get_or_create_handle("role:data_dep")
+        role_phases = self._get_phases("role:data_dep")
+
+        dep_phase_arrays = []
+        for node in G.nodes():
+            neighbors = set()
+            for _, v, d in G.out_edges(node, data=True):
+                if d.get("layer") == MultiLayerGraphBuilder.EDGE_DATA:
+                    neighbors.add(v)
+            for u, _, d in G.in_edges(node, data=True):
+                if d.get("layer") == MultiLayerGraphBuilder.EDGE_DATA:
+                    neighbors.add(u)
+
+            valid_phases = [node_phase_map[n] for n in neighbors if n in node_phase_map]
+            if not valid_phases:
+                continue
+
+            dep_bundle_p = bundle_phases(valid_phases)
+            dep_p = bind_phases(role_phases, dep_bundle_p)
+            dep_phase_arrays.append(dep_p)
+
+        return dep_phase_arrays
+
     # ── Full projection pipeline ─────────────────────────────────
 
-    def project(self, code: str) -> int:
-        """Map source code → single holographic hypervector handle.
+    def project(self, code: str) -> 'LayeredProjection':
+        """Map source code → LayeredProjection with per-layer handles and phases.
 
-        Returns an arena handle encoding the full multi-layer topology.
+        The final_handle is the cross-layer bind: ast ⊗ cfg ⊗ data.
+        Layer handles and phase arrays enable algebraic unbinding for decoding.
         """
         G = self.builder.build(code)
         G = self.builder.ca.evolve(G)
+        return self._project_from_graph(G)
 
-        # Phase 1: project every node independently
+    def project_handle(self, code: str) -> int:
+        """Backward-compatible: returns only the final bound handle."""
+        return self.project(code).final_handle
+
+    def _project_from_graph(self, G: nx.DiGraph) -> 'LayeredProjection':
+        """Core projection logic on a pre-built, evolved graph."""
+        # Phase 1: project every node (arena handles + phase arrays)
         node_handles: Dict[int, int] = {}
+        node_phase_map: Dict[int, List[float]] = {}
         for node in G.nodes():
             node_handles[node] = self._project_node(node, G.nodes[node])
+            node_phase_map[node] = self._project_node_phases(G.nodes[node])
 
         # Phase 2: AST structural layer — bundle all node vectors
         ast_bundle_h = self.arena.allocate()
         all_node_h = list(node_handles.values())
+        all_node_phases = [node_phase_map[n] for n in G.nodes()]
         if all_node_h:
             self.arena.bundle(all_node_h, ast_bundle_h)
+        ast_phases = bundle_phases(all_node_phases) if all_node_phases else [0.0] * self.dimension
 
-        # Phase 3: CFG sequential layer — chain-bind paths, then bundle
+        # Phase 3: CFG sequential layer
         cfg_chains = self._project_cfg_chains(G, node_handles)
+        cfg_chain_phases = self._project_cfg_chain_phases(G, node_phase_map)
         if cfg_chains:
             cfg_layer_h = self.arena.allocate()
             self.arena.bundle(cfg_chains, cfg_layer_h)
+            cfg_phases = bundle_phases(cfg_chain_phases)
         else:
             cfg_layer_h = None
+            cfg_phases = None
 
-        # Phase 4: Data-dep set layer — bundle all dep projections
-        dep_projections = self._project_data_dep_sets(G, node_handles)
-        if dep_projections:
+        # Phase 4: Data-dep set layer
+        dep_handles = self._project_data_dep_sets(G, node_handles)
+        dep_phase_arrays = self._project_data_dep_phases(G, node_phase_map)
+        if dep_handles:
             data_layer_h = self.arena.allocate()
-            self.arena.bundle(dep_projections, data_layer_h)
+            self.arena.bundle(dep_handles, data_layer_h)
+            data_phases = bundle_phases(dep_phase_arrays)
         else:
             data_layer_h = None
+            data_phases = None
 
-        # Phase 5: Merge layers via bind (⊗) to produce final hologram
-        # code_vector = ast_layer ⊗ cfg_layer ⊗ data_layer
+        # Phase 5: Cross-layer bind → final hologram
         result_h = ast_bundle_h
         if cfg_layer_h is not None:
             merged = self.arena.allocate()
@@ -219,40 +342,16 @@ class IsomorphicProjector:
             self.arena.bind(result_h, data_layer_h, merged)
             result_h = merged
 
-        return result_h
+        return LayeredProjection(
+            final_handle=result_h,
+            ast_handle=ast_bundle_h,
+            cfg_handle=cfg_layer_h,
+            data_handle=data_layer_h,
+            ast_phases=ast_phases,
+            cfg_phases=cfg_phases,
+            data_phases=data_phases,
+        )
 
-    def project_graph(self, G: nx.DiGraph) -> int:
-        """Project a pre-built, pre-evolved graph (for callers that already
-        have the graph object). Skips build + evolve."""
-        node_handles: Dict[int, int] = {}
-        for node in G.nodes():
-            node_handles[node] = self._project_node(node, G.nodes[node])
-
-        ast_bundle_h = self.arena.allocate()
-        all_node_h = list(node_handles.values())
-        if all_node_h:
-            self.arena.bundle(all_node_h, ast_bundle_h)
-
-        cfg_chains = self._project_cfg_chains(G, node_handles)
-        cfg_layer_h = None
-        if cfg_chains:
-            cfg_layer_h = self.arena.allocate()
-            self.arena.bundle(cfg_chains, cfg_layer_h)
-
-        dep_projections = self._project_data_dep_sets(G, node_handles)
-        data_layer_h = None
-        if dep_projections:
-            data_layer_h = self.arena.allocate()
-            self.arena.bundle(dep_projections, data_layer_h)
-
-        result_h = ast_bundle_h
-        if cfg_layer_h is not None:
-            merged = self.arena.allocate()
-            self.arena.bind(result_h, cfg_layer_h, merged)
-            result_h = merged
-        if data_layer_h is not None:
-            merged = self.arena.allocate()
-            self.arena.bind(result_h, data_layer_h, merged)
-            result_h = merged
-
-        return result_h
+    def project_graph(self, G: nx.DiGraph) -> 'LayeredProjection':
+        """Project a pre-built, pre-evolved graph."""
+        return self._project_from_graph(G)

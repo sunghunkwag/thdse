@@ -1,12 +1,13 @@
 """
 Tests for the Multi-Layer Topological Phase-Transition Engine.
 
-Covers all five modules:
+Covers all six modules:
   1. hdc_core       — Rust FHRR Arena (VSA engine)
   2. topology       — MultiLayerGraphBuilder + TopologicalASTGraphCA
-  3. projection     — IsomorphicProjector (Graph → VSA)
-  4. synthesis      — AxiomaticSynthesizer (Phase Transition)
-  5. decoder        — ConstraintDecoder (VSA → SMT → AST)
+  3. projection     — IsomorphicProjector → LayeredProjection
+  4. synthesis      — AxiomaticSynthesizer (per-layer phase transition)
+  5. decoder        — ConstraintDecoder (layer-aware unbinding → SMT → AST)
+  6. utils          — arena_ops (phase algebra)
 """
 import sys
 import os
@@ -81,17 +82,69 @@ def test_hdc_core():
     return True
 
 
+# ── Test 2b: Arena ops (phase algebra) ──────────────────────────
+
+def test_arena_ops():
+    """Verify conjugate unbinding: bind(V, conj(V)) ≈ identity."""
+    try:
+        import hdc_core
+    except ImportError:
+        print("[SKIP] arena_ops (hdc_core not compiled)")
+        return
+
+    from src.utils.arena_ops import conjugate_into, bind_phases, bundle_phases, negate_phases
+
+    dim = 256
+    arena = hdc_core.FhrrArena(32, dim)
+
+    # Create a vector with known phases
+    phases = [0.5 * i / dim * math.pi for i in range(dim)]
+    h_orig = arena.allocate()
+    arena.inject_phases(h_orig, phases)
+
+    # Create its conjugate
+    h_conj = arena.allocate()
+    conjugate_into(arena, phases, h_conj)
+
+    # Bind them → should produce near-identity (all phases ≈ 0)
+    h_identity = arena.allocate()
+    arena.bind(h_orig, h_conj, h_identity)
+
+    # The identity vector has phases ≈ 0, so correlate with a true identity
+    # (inject all-zero phases → [1,0,1,0,...])
+    h_true_id = arena.allocate()
+    arena.inject_phases(h_true_id, [0.0] * dim)
+
+    corr = arena.compute_correlation(h_identity, h_true_id)
+    assert corr > 0.95, f"Conjugate unbinding failed: corr with identity = {corr:.4f}"
+
+    # Verify phase algebra functions
+    pa = [0.1, 0.2, 0.3]
+    pb = [0.4, 0.5, 0.6]
+    bound = bind_phases(pa, pb)
+    assert len(bound) == 3
+    assert abs(bound[0] - 0.5) < 1e-10
+
+    bundled = bundle_phases([pa, pb])
+    assert len(bundled) == 3
+
+    negated = negate_phases(pa)
+    assert abs(negated[0] + 0.1) < 1e-10
+
+    print("[PASS] arena_ops (conjugate unbinding verified)")
+
+
 # ── Test 3: Isomorphic Projector ────────────────────────────────
 
 def test_isomorphic_projector():
-    """Project two different code snippets and verify their vectors diverge."""
+    """Project code → LayeredProjection with per-layer handles and phases."""
     try:
         import hdc_core
     except ImportError:
         print("[SKIP] projection (hdc_core not compiled)")
         return
 
-    from src.projection.isomorphic_projector import IsomorphicProjector
+    from src.projection.isomorphic_projector import IsomorphicProjector, LayeredProjection
 
     dim = 256
     arena = hdc_core.FhrrArena(100_000, dim)
@@ -101,14 +154,23 @@ def test_isomorphic_projector():
     code_b = "def bar(lst):\n    for i in lst:\n        print(i)\n"
     code_a2 = "def foo(x):\n    return x + 1\n"
 
-    h_a = proj.project(code_a)
-    h_b = proj.project(code_b)
-    h_a2 = proj.project(code_a2)
+    proj_a = proj.project(code_a)
+    proj_b = proj.project(code_b)
+    proj_a2 = proj.project(code_a2)
+
+    # Verify LayeredProjection structure
+    assert isinstance(proj_a, LayeredProjection), "project() must return LayeredProjection"
+    assert proj_a.ast_handle is not None, "AST handle must always be present"
+    assert len(proj_a.ast_phases) == dim, "AST phases must have correct dimension"
+
+    # Verify backward-compatible project_handle
+    h_compat = proj.project_handle(code_a)
+    assert isinstance(h_compat, int), "project_handle must return int"
 
     # Same code → high correlation
-    corr_same = arena.compute_correlation(h_a, h_a2)
+    corr_same = arena.compute_correlation(proj_a.final_handle, proj_a2.final_handle)
     # Different code → lower correlation
-    corr_diff = arena.compute_correlation(h_a, h_b)
+    corr_diff = arena.compute_correlation(proj_a.final_handle, proj_b.final_handle)
 
     assert corr_same > corr_diff, (
         f"Same-code correlation ({corr_same:.4f}) should exceed "
@@ -120,14 +182,14 @@ def test_isomorphic_projector():
 # ── Test 4: Axiomatic Synthesizer ───────────────────────────────
 
 def test_axiomatic_synthesizer():
-    """Ingest a small corpus, compute resonance, extract cliques, and synthesize."""
+    """Ingest corpus, compute resonance, extract cliques, per-layer synthesize."""
     try:
         import hdc_core
     except ImportError:
         print("[SKIP] synthesis (hdc_core not compiled)")
         return
 
-    from src.projection.isomorphic_projector import IsomorphicProjector
+    from src.projection.isomorphic_projector import IsomorphicProjector, LayeredProjection
     from src.synthesis.axiomatic_synthesizer import AxiomaticSynthesizer
 
     dim = 256
@@ -151,31 +213,31 @@ def test_axiomatic_synthesizer():
     results = synth.synthesize_all(min_clique_size=2)
     assert len(results) > 0, "No cliques found for synthesis"
 
-    for clique, synth_h in results:
-        orth = synth.verify_quasi_orthogonality(synth_h, clique)
-        # Synthesized vector should exist (non-null handle)
-        assert isinstance(synth_h, int), f"Invalid synthesis handle: {synth_h}"
+    for clique, synth_proj in results:
+        # synthesize_from_clique now returns LayeredProjection
+        assert isinstance(synth_proj, LayeredProjection), "Synthesis must return LayeredProjection"
+        assert synth_proj.ast_handle is not None, "Synthesized AST layer must be present"
+        orth = synth.verify_quasi_orthogonality(synth_proj.final_handle, clique)
 
     print(f"[PASS] axiomatic synthesizer ({len(results)} syntheses from {count} axioms)")
 
 
-# ── Test 5: Constraint Decoder ──────────────────────────────────
+# ── Test 5: Constraint Decoder (Signal Recovery) ────────────────
 
 def test_constraint_decoder():
-    """Project code, then decode it back via SMT and verify round-trip."""
+    """Layer-aware probing must recover actual code structure, not noise."""
     try:
         import hdc_core
     except ImportError:
         print("[SKIP] decoder (hdc_core not compiled)")
         return
 
-    import z3  # verify z3 is importable
+    import z3
 
     from src.projection.isomorphic_projector import IsomorphicProjector
     from src.decoder.constraint_decoder import ConstraintDecoder
 
     dim = 256
-    # Decoder needs a large arena for the vocabulary + projections
     arena = hdc_core.FhrrArena(500_000, dim)
     proj = IsomorphicProjector(arena, dim)
     decoder = ConstraintDecoder(arena, proj, dim,
@@ -183,29 +245,37 @@ def test_constraint_decoder():
                                 verification_threshold=0.10)
 
     code = "def foo(x):\n    if x <= 1:\n        return 1\n    return x * foo(x - 1)\n"
-    handle = proj.project(code)
+    projection = proj.project(code)
 
-    # Probe
-    constraints = decoder.probe(handle)
-    assert len(constraints.active_node_types) > 0, "No active node types detected"
+    # Layer-aware probe
+    constraints = decoder.probe_layered(projection)
 
-    # Full decode
-    source = decoder.decode_to_source(handle)
-    if source is not None:
-        # Verify it's valid Python
-        import ast as ast_mod
-        ast_mod.parse(source)
-        print(f"[PASS] constraint decoder (decoded {len(source)} chars of valid Python)")
-        print(f"       Active types: {constraints.active_node_types[:8]}...")
-    else:
-        # UNSAT is also a valid mathematical outcome
-        print("[PASS] constraint decoder (UNSAT — mathematically rejected, as designed)")
+    # CRITICAL ASSERTION: activated node types must include actual code structure
+    expected_types = {"FunctionDef", "If", "Return"}
+    activated = set(constraints.active_node_types)
+    overlap = expected_types & activated
+    assert len(overlap) >= 2, (
+        f"Layer-aware probe must recover real structure. "
+        f"Expected at least 2 of {expected_types}, got {activated}"
+    )
+
+    # Decode must produce valid Python (not just 'pass')
+    source = decoder.decode_to_source(projection)
+    assert source is not None, "Decoder must not UNSAT on valid projected code"
+    assert source.strip() != "pass", "Decoder must produce non-degenerate output"
+
+    import ast as ast_mod
+    ast_mod.parse(source)
+
+    print(f"[PASS] constraint decoder")
+    print(f"       Activated types: {sorted(activated)}")
+    print(f"       Decoded: {source}")
 
 
-# ── Test 6: Full pipeline integration ───────────────────────────
+# ── Test 6: Full Pipeline Integration ───────────────────────────
 
 def test_full_pipeline():
-    """End-to-end: ingest → synthesize → decode → verify."""
+    """End-to-end: ingest → synthesize → decode → verify valid Python."""
     try:
         import hdc_core
     except ImportError:
@@ -225,19 +295,20 @@ def test_full_pipeline():
 
     corpus = {
         "base_case":   "def f(n):\n    if n <= 0:\n        return 0\n    return n + f(n - 1)\n",
-        "accumulator":  "def g(n):\n    acc = 0\n    while n > 0:\n        acc += n\n        n -= 1\n    return acc\n",
+        "accumulator": "def g(n):\n    acc = 0\n    while n > 0:\n        acc += n\n        n -= 1\n    return acc\n",
     }
     synth.ingest_batch(corpus)
     results = synth.synthesize_all(min_clique_size=2)
 
     decoded_count = 0
-    for clique, synth_h in results:
-        source = decoder.decode_to_source(synth_h)
-        if source is not None:
+    for clique, synth_proj in results:
+        source = decoder.decode_to_source(synth_proj)
+        if source is not None and source.strip() != "pass":
             import ast as ast_mod
-            ast_mod.parse(source)  # must be valid Python
+            ast_mod.parse(source)
             decoded_count += 1
 
+    assert decoded_count > 0, "At least one synthesis must decode to valid Python"
     print(f"[PASS] full pipeline ({decoded_count}/{len(results)} syntheses decoded to valid Python)")
 
 
@@ -247,6 +318,7 @@ if __name__ == "__main__":
     test_topology_core()
     hdc_available = test_hdc_core()
     if hdc_available:
+        test_arena_ops()
         test_isomorphic_projector()
         test_axiomatic_synthesizer()
         test_constraint_decoder()
