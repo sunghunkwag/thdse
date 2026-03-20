@@ -5,6 +5,25 @@ class RuleBasedASTPatcher(ast.NodeTransformer):
     def __init__(self, typist_id: int):
         self.typist_id = typist_id
 
+    def visit_For(self, node: ast.For):
+        self.generic_visit(node)
+        if isinstance(node.iter, ast.Name):
+            list_name = node.iter.id
+            is_mutating = False
+            for child in ast.walk(ast.Module(body=node.body, type_ignores=[])):
+                if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
+                    if isinstance(child.func.value, ast.Name) and child.func.value.id == list_name:
+                        if child.func.attr in ['remove', 'append', 'pop', 'clear', 'extend']:
+                            is_mutating = True
+                            break
+            if is_mutating:
+                node.iter = ast.Subscript(
+                    value=ast.Name(id=list_name, ctx=ast.Load()),
+                    slice=ast.Slice(lower=None, upper=None, step=None),
+                    ctx=ast.Load()
+                )
+        return node
+
     def visit_FunctionDef(self, node: ast.FunctionDef):
         self.generic_visit(node)
         
