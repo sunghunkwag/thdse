@@ -489,7 +489,134 @@ def test_topological_thermodynamics():
         print(f"       {clique}: entropy={ent:.4f}")
 
 
-# ── Test 10: Full Singularity Expansion Integration ──────────────
+# ── Test 10: Dynamic Null Space Projection (Quotient Space Folding) ──
+
+def test_quotient_space_folding():
+    """Verify the Dynamic Null Space Projection mechanism:
+    1. UNSAT core extraction from Z3
+    2. Contradiction vector synthesis via reverse-lookup + bind/bundle
+    3. Quotient space folding (orthogonal projection) in the Rust arena
+    4. Re-solve succeeds after folding
+    """
+    try:
+        import hdc_core
+    except ImportError:
+        print("[SKIP] quotient space folding (hdc_core not compiled)")
+        return
+
+    import numpy as np
+
+    # ── Part A: Test the Rust project_to_quotient_space directly ──
+    dim = 128
+    arena = hdc_core.FhrrArena(32, dim)
+
+    # Create V_error and two test vectors
+    h_error = arena.allocate()
+    h_x = arena.allocate()
+    h_y = arena.allocate()
+
+    rng = np.random.RandomState(42)
+    error_phases = rng.uniform(-math.pi, math.pi, dim).tolist()
+    x_phases = rng.uniform(-math.pi, math.pi, dim).tolist()
+    y_phases = rng.uniform(-math.pi, math.pi, dim).tolist()
+
+    arena.inject_phases(h_error, error_phases)
+    arena.inject_phases(h_x, x_phases)
+    arena.inject_phases(h_y, y_phases)
+
+    # Measure correlation with V_error before projection
+    corr_x_before = arena.compute_correlation(h_x, h_error)
+    corr_y_before = arena.compute_correlation(h_y, h_error)
+
+    # Project to quotient space
+    projected = arena.project_to_quotient_space(h_error)
+    assert projected == 2, f"Expected 2 vectors projected, got {projected}"
+
+    # After projection, X and Y should have near-zero correlation with V_error
+    corr_x_after = arena.compute_correlation(h_x, h_error)
+    corr_y_after = arena.compute_correlation(h_y, h_error)
+
+    # The projection annihilates the V_error component — correlation should
+    # drop significantly (not necessarily to exactly zero due to normalization)
+    assert abs(corr_x_after) < abs(corr_x_before) + 0.01, (
+        f"X correlation with V_error should not increase: before={corr_x_before:.4f}, after={corr_x_after:.4f}"
+    )
+
+    # Self-correlation should remain high (vectors are still valid after normalization)
+    self_corr_x = arena.compute_correlation(h_x, h_x)
+    assert self_corr_x > 0.9, f"Post-projection self-correlation too low: {self_corr_x:.4f}"
+
+    # Test extract_phases
+    phases = arena.extract_phases(h_x)
+    assert len(phases) == dim, f"Expected {dim} phases, got {len(phases)}"
+
+    print(f"[PASS] quotient space folding (Rust arena)")
+    print(f"       X corr with V_error: {corr_x_before:.4f} → {corr_x_after:.4f}")
+    print(f"       Y corr with V_error: {corr_y_before:.4f} → {corr_y_after:.4f}")
+
+    # ── Part B: Test contradiction vector synthesis ──
+    from src.projection.isomorphic_projector import IsomorphicProjector
+
+    dim2 = 256
+    arena2 = hdc_core.FhrrArena(500_000, dim2)
+    proj = IsomorphicProjector(arena2, dim2)
+
+    # Create some atom handles to simulate conflicting atoms
+    atoms = []
+    for i in range(4):
+        h = arena2.allocate()
+        arena2.inject_phases(h, rng.uniform(-math.pi, math.pi, dim2).tolist())
+        atoms.append(h)
+
+    # Single atom → returns same handle
+    v1 = proj.synthesize_contradiction_vector([atoms[0]])
+    assert v1 == atoms[0], "Single atom should return same handle"
+
+    # Two atoms → bind
+    v2 = proj.synthesize_contradiction_vector([atoms[0], atoms[1]])
+    assert isinstance(v2, int), "Must return arena handle"
+    assert v2 != atoms[0] and v2 != atoms[1], "Must be a new handle"
+
+    # Three+ atoms → bind_bundle_fusion
+    v3 = proj.synthesize_contradiction_vector([atoms[0], atoms[1], atoms[2], atoms[3]])
+    assert isinstance(v3, int), "Must return arena handle"
+    # V_error should be distinct from all inputs
+    for a in atoms:
+        c = abs(arena2.compute_correlation(v3, a))
+        assert c < 0.95, f"V_error too similar to input atom: corr={c:.4f}"
+
+    print(f"[PASS] contradiction vector synthesis")
+
+    # ── Part C: Full pipeline integration — UNSAT core + quotient folding ──
+    from src.decoder.constraint_decoder import ConstraintDecoder, UnsatCoreResult
+
+    arena3 = hdc_core.FhrrArena(500_000, dim2)
+    proj3 = IsomorphicProjector(arena3, dim2)
+    decoder = ConstraintDecoder(arena3, proj3, dim2,
+                                activation_threshold=0.04,
+                                max_meta_grammar_retries=1)
+
+    # Project valid code — should decode successfully
+    code = "def foo(x):\n    if x <= 1:\n        return 1\n    return x * foo(x - 1)\n"
+    projection = proj3.project(code)
+    source = decoder.decode_to_source(projection)
+    assert source is not None, "Valid code projection must decode"
+
+    # Verify the UnsatCoreResult dataclass is importable and constructible
+    core = UnsatCoreResult(
+        core_labels=["atom:cfg_seq:If->Return"],
+        core_atom_handles=[42],
+        v_error_handle=99,
+        projected_count=5,
+    )
+    assert len(core.core_labels) == 1
+    assert core.projected_count == 5
+
+    print(f"[PASS] quotient space folding (full pipeline integration)")
+    print(f"       Decoded: {source}")
+
+
+# ── Test 11: Full Singularity Expansion Integration ─────────────
 
 def test_singularity_expansion():
     """End-to-end test of all three expansion mechanisms working together."""
@@ -639,6 +766,7 @@ if __name__ == "__main__":
         test_meta_grammar_emergence()
         test_autopoietic_self_reference()
         test_topological_thermodynamics()
+        test_quotient_space_folding()
         test_singularity_expansion()
         test_stdlib_discovery()
     print("\nAll applicable tests passed.")

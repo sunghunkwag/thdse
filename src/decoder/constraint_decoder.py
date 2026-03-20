@@ -71,6 +71,15 @@ class DecodedConstraints:
 
 
 @dataclass
+class UnsatCoreResult:
+    """Result of UNSAT Core extraction from a Z3 solver."""
+    core_labels: List[str]          # Z3 tracking labels from the UNSAT core
+    core_atom_handles: List[int]    # Arena handles of conflicting atoms
+    v_error_handle: Optional[int] = None   # Synthesized contradiction vector handle
+    projected_count: int = 0        # Number of arena vectors projected to quotient space
+
+
+@dataclass
 class MetaGrammarEvent:
     """Records a Meta-Grammar Emergence event triggered by topological contradiction."""
     trigger: str                    # "unsat_dimension_expand" or "unsat_fusion_retry"
@@ -79,6 +88,7 @@ class MetaGrammarEvent:
     retry_succeeded: bool
     entropy_before: Optional[float] = None
     entropy_after: Optional[float] = None
+    unsat_core: Optional[UnsatCoreResult] = None  # Attached core when quotient folding used
 
 
 # ── Known AST node types for the codebook ────────────────────────
@@ -325,14 +335,20 @@ class ConstraintDecoder:
 
     def encode_smt(
         self, constraints: DecodedConstraints, entropy_budget: Optional[float] = None,
+        enable_unsat_core: bool = False,
     ) -> Tuple[z3.Solver, Dict]:
         """Translate topological constraints into Z3 formulas.
 
         If entropy_budget is provided (Topological Thermodynamics), adds a strict
         constraint that total structural complexity must not exceed the budget.
         The solver must find the lowest-entropy satisfying model.
+
+        If enable_unsat_core is True, uses Z3's assert_and_track for topological
+        constraints so that the UNSAT core can be extracted on contradiction.
         """
         solver = z3.Solver()
+        if enable_unsat_core:
+            solver.set("unsat_core", True)
         vars_map = {}
 
         node_vars = {}
@@ -373,6 +389,17 @@ class ConstraintDecoder:
             if key not in cfg_pairs or score > cfg_pairs[key][1]:
                 cfg_pairs[key] = ((a, b), score)
 
+        # Helper: add a constraint, optionally tracked for UNSAT core extraction
+        _track_idx = [0]  # mutable counter for unique tracking labels
+
+        def _add_tracked(s: z3.Solver, constraint, track_label: Optional[str] = None):
+            """Add constraint with optional UNSAT core tracking."""
+            if enable_unsat_core and track_label is not None:
+                tracker = z3.Bool(track_label)
+                s.assert_and_track(constraint, tracker)
+            else:
+                s.add(constraint)
+
         for (a, b), _score in sorted(cfg_pairs.values(), key=lambda x: -x[1]):
             if a in order_vars and b in order_vars and a in node_vars and b in node_vars:
                 c = z3.Implies(z3.And(node_vars[a], node_vars[b]),
@@ -381,7 +408,7 @@ class ConstraintDecoder:
                 solver.add(c)
                 if solver.check() == z3.sat:
                     solver.pop()
-                    solver.add(c)  # Permanent add
+                    _add_tracked(solver, c, f"atom:cfg_seq:{a}->{b}")
                 else:
                     solver.pop()  # Discard contradictory constraint
 
@@ -398,7 +425,7 @@ class ConstraintDecoder:
                     solver.add(c)
                     if solver.check() == z3.sat:
                         solver.pop()
-                        solver.add(c)
+                        _add_tracked(solver, c, f"atom:cfg_branch:{cond}->{then_t}")
                     else:
                         solver.pop()
 
@@ -414,9 +441,9 @@ class ConstraintDecoder:
                     solver.add(c2)
                 if solver.check() == z3.sat:
                     solver.pop()
-                    solver.add(c1)
+                    _add_tracked(solver, c1, f"atom:cfg_loop:{header}->{body_type}")
                     if header in order_vars and body_type in order_vars:
-                        solver.add(c2)
+                        _add_tracked(solver, c2, f"atom:cfg_loop_order:{header}->{body_type}")
                 else:
                     solver.pop()
 
@@ -430,7 +457,7 @@ class ConstraintDecoder:
                     solver.add(c)
                     if solver.check() == z3.sat:
                         solver.pop()
-                        solver.add(c)
+                        _add_tracked(solver, c, f"atom:data_dep:{def_type}->{use_type}")
                     else:
                         solver.pop()
 
@@ -632,6 +659,104 @@ class ConstraintDecoder:
             return None
         return builder()
 
+    # ── Dynamic Null Space Projection: Quotient Space Folding ──────
+
+    def _extract_unsat_core(self, solver: z3.Solver) -> List[str]:
+        """Extract the UNSAT core from a solver that returned UNSAT.
+
+        Returns the list of tracking labels (constraint names) that form
+        the minimal conflicting subset. These labels correspond to atom
+        vocabulary keys (e.g., "atom:cfg_seq:If->Return").
+        """
+        core = solver.unsat_core()
+        return [str(c) for c in core]
+
+    def _reverse_lookup_handles(self, core_labels: List[str]) -> List[int]:
+        """Map UNSAT core constraint labels back to arena atom handles.
+
+        Each label in the core corresponds to a structural atom in the
+        vocabulary. This performs the reverse lookup to recover the
+        hypervector handles that encode the conflicting constraints.
+        """
+        handles = []
+        seen = set()
+        for label in core_labels:
+            if label in self._atom_vocab:
+                h = self._atom_vocab[label].handle
+                if h not in seen:
+                    handles.append(h)
+                    seen.add(h)
+        return handles
+
+    def _attempt_quotient_folding(
+        self,
+        projection: LayeredProjection,
+        constraints: DecodedConstraints,
+        entropy_budget: Optional[float] = None,
+    ) -> Optional[Tuple[ast.Module, UnsatCoreResult]]:
+        """Attempt to resolve an UNSAT via Dynamic Null Space Projection.
+
+        Pipeline:
+          1. Re-encode constraints with UNSAT core tracking enabled
+          2. If UNSAT, extract the minimal conflicting core
+          3. Reverse-lookup core labels → arena atom handles
+          4. Synthesize Contradiction Vector V_error = bind/bundle of conflicting atoms
+          5. Project entire arena to quotient space H / <V_error>
+          6. Re-probe the (now folded) projection and re-solve
+
+        Returns (ast.Module, UnsatCoreResult) on success, None on failure.
+        """
+        # Step 1: Re-encode with UNSAT core tracking
+        solver, vars_map = self.encode_smt(
+            constraints, entropy_budget=entropy_budget, enable_unsat_core=True,
+        )
+        result = solver.check()
+
+        if result == z3.sat:
+            # Not actually UNSAT — solve succeeded with tracked assertions
+            return self.compile_model(solver.model(), vars_map), UnsatCoreResult(
+                core_labels=[], core_atom_handles=[], v_error_handle=None, projected_count=0,
+            )
+
+        if result != z3.unsat:
+            return None  # Unknown result
+
+        # Step 2: Extract the UNSAT core
+        core_labels = self._extract_unsat_core(solver)
+        if not core_labels:
+            return None  # Empty core — cannot isolate contradiction
+
+        # Step 3: Reverse-lookup to arena handles
+        core_handles = self._reverse_lookup_handles(core_labels)
+        if not core_handles:
+            return None  # No matching atoms found
+
+        # Step 4: Synthesize Contradiction Vector
+        v_error = self.projector.synthesize_contradiction_vector(core_handles)
+
+        # Step 5: Project arena to quotient space H / <V_error>
+        projected_count = self.arena.project_to_quotient_space(v_error)
+
+        core_result = UnsatCoreResult(
+            core_labels=core_labels,
+            core_atom_handles=core_handles,
+            v_error_handle=v_error,
+            projected_count=projected_count,
+        )
+
+        # Step 6: Re-probe the folded projection and re-solve
+        folded_constraints = self.probe(projection)
+        if not folded_constraints.active_node_types:
+            return None
+
+        folded_solver, folded_vars = self.encode_smt(
+            folded_constraints, entropy_budget=entropy_budget,
+        )
+        if folded_solver.check() == z3.sat:
+            return self.compile_model(folded_solver.model(), folded_vars), core_result
+
+        return None
+
     # ── Meta-Grammar Emergence: UNSAT Resolution ───────────────────
 
     def _attempt_fusion_reprobe(
@@ -768,8 +893,28 @@ class ConstraintDecoder:
             model = solver.model()
             return self.compile_model(model, vars_map)
 
-        # ── Meta-Grammar Emergence: UNSAT triggers expansion ──────
+        # ── Phase Transition: Dynamic Null Space Projection ──────
+        # Attempt quotient space folding FIRST (algebraically cheapest:
+        # no dimension change, no re-projection, just annihilate the
+        # contradiction axis and re-solve).
         old_dim = self.dimension
+
+        if isinstance(input_, LayeredProjection):
+            folding_result = self._attempt_quotient_folding(
+                input_, constraints, entropy_budget=entropy_budget,
+            )
+            if folding_result is not None:
+                compiled_ast, core_result = folding_result
+                self._meta_grammar_log.append(MetaGrammarEvent(
+                    trigger="unsat_quotient_folding",
+                    old_dimension=old_dim,
+                    new_dimension=old_dim,
+                    retry_succeeded=True,
+                    unsat_core=core_result,
+                ))
+                return compiled_ast
+
+        # ── Meta-Grammar Emergence: UNSAT triggers expansion ──────
 
         for retry in range(self.max_meta_grammar_retries):
             # Attempt 1: Fusion operator (cheaper — no dimension change)

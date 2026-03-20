@@ -280,6 +280,48 @@ impl FhrrArena {
         let entropy = (binds as f32) * ln2 + (bundles as f32) * ln2;
         Ok(entropy)
     }
+
+    // ── Dynamic Null Space Projection: Quotient Space Folding ─────
+
+    /// Project the entire arena into the quotient space H / <V_error>.
+    ///
+    /// For every live hypervector X in the arena, annihilate the component
+    /// parallel to the Contradiction Vector V_error:
+    ///
+    ///   X_new = X - V_error · (V_error^H · X) / (V_error^H · V_error)
+    ///
+    /// where V_error^H denotes the conjugate transpose (Hermitian adjoint).
+    ///
+    /// After projection, each component is re-normalized to unit magnitude
+    /// to preserve the FHRR invariant (|z_j| = 1 for all j).
+    ///
+    /// This maps the vector space H → H / <V_error>, collapsing the axis
+    /// of contradiction to zero and forcing previously conflicting structures
+    /// to become mathematically equivalent.
+    ///
+    /// Complexity: O(head × dimension) — linear in live vectors × dimension.
+    /// Memory: in-place modification, no auxiliary arena allocation.
+    pub fn project_to_quotient_space(&mut self, v_error_id: usize) -> PyResult<usize> {
+        self.validate_handles(&[v_error_id])?;
+        unsafe { self.project_to_quotient_space_simd(v_error_id) }
+    }
+
+    /// Extract the raw phase array (angles) from a handle. Used by Python
+    /// to read back projected vectors without round-tripping through inject.
+    pub fn extract_phases(&self, handle: usize) -> PyResult<Vec<f32>> {
+        if handle >= self.head {
+            return Err(PyIndexError::new_err("Invalid handle"));
+        }
+        let floats = self.dimension * 2;
+        let offset = handle * floats;
+        let mut phases = Vec::with_capacity(self.dimension);
+        for j in 0..self.dimension {
+            let re = self.buffer[offset + 2 * j];
+            let im = self.buffer[offset + 2 * j + 1];
+            phases.push(im.atan2(re));
+        }
+        Ok(phases)
+    }
 }
 
 impl FhrrArena {
@@ -337,8 +379,8 @@ impl FhrrArena {
         
         let floats = self.dimension * 2;
         let p_buf = self.buffer.as_mut_ptr();
-        let mut p_out = p_buf.add(out_handle * floats);
-        
+        let p_out = p_buf.add(out_handle * floats);
+
         ptr::write_bytes(p_out, 0, floats);
 
         for h in handles {
@@ -407,6 +449,132 @@ impl FhrrArena {
             }
         }
         Ok(())
+    }
+
+    /// AVX2-accelerated quotient space projection.
+    ///
+    /// Two-pass algorithm per vector X:
+    ///   Pass 1 (scalar): compute complex inner product <V_error, X> and ||V_error||²
+    ///   Pass 2 (SIMD):   X -= V_error · (<V_error^H · X> / ||V_error||²), then normalize
+    ///
+    /// Returns the number of vectors projected.
+    #[target_feature(enable = "avx2", enable = "fma")]
+    unsafe fn project_to_quotient_space_simd(&mut self, v_error_id: usize) -> PyResult<usize> {
+        let floats = self.dimension * 2;
+        let v_offset = v_error_id * floats;
+
+        // Compute ||V_error||² = V_error^H · V_error (always real)
+        let mut norm_sq: f32 = 0.0;
+        for i in 0..floats {
+            let val = self.buffer[v_offset + i];
+            norm_sq += val * val;
+        }
+
+        if norm_sq < 1e-12 {
+            // V_error is effectively zero — nothing to project out
+            return Ok(0);
+        }
+
+        let inv_norm_sq = 1.0 / norm_sq;
+        let mut projected_count: usize = 0;
+
+        for h in 0..self.head {
+            if h == v_error_id {
+                continue;
+            }
+
+            let x_offset = h * floats;
+
+            // ── Pass 1: Complex inner product <V_error, X> = V^H · X ──
+            // = Σ_j conj(V_j) · X_j
+            // = Σ_j (V_re·X_re + V_im·X_im) + i·(V_re·X_im − V_im·X_re)
+            let mut dot_re: f32 = 0.0;
+            let mut dot_im: f32 = 0.0;
+
+            for j in 0..self.dimension {
+                let v_re = *self.buffer.as_ptr().add(v_offset + 2 * j);
+                let v_im = *self.buffer.as_ptr().add(v_offset + 2 * j + 1);
+                let x_re = *self.buffer.as_ptr().add(x_offset + 2 * j);
+                let x_im = *self.buffer.as_ptr().add(x_offset + 2 * j + 1);
+
+                dot_re += v_re * x_re + v_im * x_im;
+                dot_im += v_re * x_im - v_im * x_re;
+            }
+
+            // Projection coefficient: c = <V^H, X> / ||V||²
+            let coeff_re = dot_re * inv_norm_sq;
+            let coeff_im = dot_im * inv_norm_sq;
+
+            // Skip if projection component is negligible
+            if coeff_re * coeff_re + coeff_im * coeff_im < 1e-16 {
+                continue;
+            }
+
+            // ── Pass 2 (AVX2): X -= V · c, then normalize ─────────────
+            // V·c component j:
+            //   proj_re = V_re·c_re − V_im·c_im
+            //   proj_im = V_re·c_im + V_im·c_re
+            //
+            // We broadcast c_re to even lanes, c_im to odd lanes, then
+            // use the same addsub pattern as bind_simd.
+
+            // Build broadcast vectors for coefficient
+            // coeff_interleaved = [c_re, c_im, c_re, c_im, ...]
+            let coeff_arr: [f32; 8] = [
+                coeff_re, coeff_im, coeff_re, coeff_im,
+                coeff_re, coeff_im, coeff_re, coeff_im,
+            ];
+            let v_coeff = _mm256_loadu_ps(coeff_arr.as_ptr());
+            // coeff_swapped = [c_im, c_re, c_im, c_re, ...]
+            let v_coeff_swap = _mm256_shuffle_ps(v_coeff, v_coeff, 0xb1);
+
+            let p_buf = self.buffer.as_mut_ptr();
+            let mut p_v = p_buf.add(v_offset);
+            let mut p_x = p_buf.add(x_offset);
+            let end = p_v.add(floats);
+
+            while p_v < end.sub(7) {
+                let v_vec = _mm256_loadu_ps(p_v);
+                let x_vec = _mm256_loadu_ps(p_x);
+
+                // Complex multiply V · coeff using moveldup/movehdup + addsub
+                let v_real = _mm256_moveldup_ps(v_vec);  // [v_re, v_re, ...]
+                let v_imag = _mm256_movehdup_ps(v_vec);  // [v_im, v_im, ...]
+
+                let prod1 = _mm256_mul_ps(v_real, v_coeff);      // [v_re·c_re, v_re·c_im, ...]
+                let prod2 = _mm256_mul_ps(v_imag, v_coeff_swap); // [v_im·c_im, v_im·c_re, ...]
+
+                // addsub: even lanes subtract, odd lanes add
+                // result = [v_re·c_re − v_im·c_im, v_re·c_im + v_im·c_re, ...]
+                let proj = _mm256_addsub_ps(prod1, prod2);
+
+                // X -= proj
+                let result = _mm256_sub_ps(x_vec, proj);
+                _mm256_storeu_ps(p_x, result);
+
+                p_v = p_v.add(8);
+                p_x = p_x.add(8);
+            }
+
+            // Scalar tail for remaining elements
+            while p_v < end {
+                let v_re = *p_v;
+                let v_im = *p_v.add(1);
+                let proj_re = v_re * coeff_re - v_im * coeff_im;
+                let proj_im = v_re * coeff_im + v_im * coeff_re;
+                *p_x -= proj_re;
+                *p_x.add(1) -= proj_im;
+                p_v = p_v.add(2);
+                p_x = p_x.add(2);
+            }
+
+            // Re-normalize each component to unit magnitude (FHRR invariant)
+            self.normalize_simd(h)?;
+
+            projected_count += 1;
+        }
+
+        Ok(projected_count)
     }
 }
 
