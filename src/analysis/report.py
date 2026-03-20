@@ -1,7 +1,8 @@
 """Report generator for structural analysis results.
 
 Produces structured JSON and human-readable Markdown reports from
-resonance analysis, clustering, and clique interpretation.
+resonance analysis, clustering, clique interpretation, structural diffs,
+refactoring candidates, and temporal analysis.
 """
 
 import json
@@ -16,10 +17,18 @@ from src.analysis.resonance_analyzer import ResonanceAnalyzer, CliqueFingerpint
 class ReportGenerator:
     """Generates JSON and Markdown reports from analysis results.
 
+    Supports extended report sections:
+      - Structural diff results (layer-decomposed similarity)
+      - Refactoring candidates (structural duplicates + interface unification)
+      - Temporal analysis (version-to-version change classification)
+
     Usage:
         analyzer = ResonanceAnalyzer(synth, decoder)
         analyzer.compute_resonance()
         report = ReportGenerator(analyzer, dimension=256)
+        report.add_structural_diffs(diff_results)
+        report.add_refactoring_candidates(candidates)
+        report.add_temporal_analysis(temporal_results)
         report.generate("/path/to/output/")
     """
 
@@ -39,6 +48,33 @@ class ReportGenerator:
         self.analyzer = analyzer
         self.dimension = dimension
         self.corpus_name = corpus_name
+        self._structural_diffs: List[Dict[str, Any]] = []
+        self._refactoring_candidates: Optional[Dict[str, Any]] = None
+        self._temporal_analysis: List[Dict[str, Any]] = []
+
+    def add_structural_diffs(self, diffs: List[Dict[str, Any]]) -> None:
+        """Add structural diff results to the report.
+
+        Args:
+            diffs: List of serialized StructuralDelta dictionaries.
+        """
+        self._structural_diffs = diffs
+
+    def add_refactoring_candidates(self, candidates: Dict[str, Any]) -> None:
+        """Add refactoring candidates to the report.
+
+        Args:
+            candidates: Serialized RefactoringDetector output.
+        """
+        self._refactoring_candidates = candidates
+
+    def add_temporal_analysis(self, results: List[Dict[str, Any]]) -> None:
+        """Add temporal analysis results to the report.
+
+        Args:
+            results: List of serialized TemporalDelta dictionaries.
+        """
+        self._temporal_analysis = results
 
     def build_report_data(self) -> Dict[str, Any]:
         """Collect all analysis data into a structured dictionary.
@@ -119,7 +155,7 @@ class ReportGenerator:
         except Exception:
             linkage_data = []
 
-        return {
+        result = {
             "summary": summary,
             "top_resonant_pairs": pairs_data,
             "lowest_resonance_outliers": outlier_data,
@@ -130,6 +166,16 @@ class ReportGenerator:
             "dendrogram_linkage": linkage_data,
             "axiom_ids": ids,
         }
+
+        # Extended sections (LEAP 2+)
+        if self._structural_diffs:
+            result["structural_diffs"] = self._structural_diffs
+        if self._refactoring_candidates:
+            result["refactoring_candidates"] = self._refactoring_candidates
+        if self._temporal_analysis:
+            result["temporal_analysis"] = self._temporal_analysis
+
+        return result
 
     def generate_json(self, output_path: str) -> str:
         """Write the full report as JSON.
@@ -256,6 +302,70 @@ class ReportGenerator:
         else:
             lines.append("*No cross-project bridges found (single project or no high-resonance pairs).*")
         lines.append("")
+
+        # Structural Diffs (LEAP 2)
+        if data.get("structural_diffs"):
+            lines.append("## Structural Diffs (Layer-Decomposed)")
+            lines.append("")
+            lines.append("> Per-layer similarity between file pairs, showing which")
+            lines.append("> topology layer drives the similarity or difference.")
+            lines.append("")
+            lines.append("| File A | File B | AST | CFG | Data | Diagnosis |")
+            lines.append("|--------|--------|-----|-----|------|-----------|")
+            for d in data["structural_diffs"][:20]:
+                ls = d.get("layer_similarity", d)
+                ast_s = f"{ls.get('ast', 'N/A'):.4f}" if isinstance(ls.get('ast'), (int, float)) else "N/A"
+                cfg_s = f"{ls.get('cfg', 'N/A'):.4f}" if isinstance(ls.get('cfg'), (int, float)) else "N/A"
+                data_s = f"{ls.get('data', 'N/A'):.4f}" if isinstance(ls.get('data'), (int, float)) else "N/A"
+                diag = ls.get("diagnosis", d.get("summary", ""))[:60]
+                fa = d.get("file_a", "?")
+                fb = d.get("file_b", "?")
+                lines.append(f"| `{fa}` | `{fb}` | {ast_s} | {cfg_s} | {data_s} | {diag} |")
+            lines.append("")
+
+        # Refactoring Candidates (LEAP 2C)
+        if data.get("refactoring_candidates"):
+            rc = data["refactoring_candidates"]
+            lines.append("## Refactoring Candidates")
+            lines.append("")
+
+            dupes = rc.get("structural_duplicates", [])
+            if dupes:
+                lines.append("### Structural Duplicates")
+                lines.append("")
+                lines.append("> Files in different directories with highly similar topology.")
+                lines.append("> Consider extracting common code into shared modules.")
+                lines.append("")
+                for d in dupes[:10]:
+                    lines.append(f"- `{d['file_a']}` <-> `{d['file_b']}` — {d['recommendation']}")
+                lines.append("")
+
+            unifs = rc.get("interface_unification_candidates", [])
+            if unifs:
+                lines.append("### Interface Unification Candidates")
+                lines.append("")
+                lines.append("> Files with the same data flow but different syntax.")
+                lines.append("> Candidate for unification behind a common interface.")
+                lines.append("")
+                for u in unifs[:10]:
+                    lines.append(f"- `{u['file_a']}` <-> `{u['file_b']}` — {u['recommendation']}")
+                lines.append("")
+
+        # Temporal Analysis (LEAP 2D)
+        if data.get("temporal_analysis"):
+            lines.append("## Temporal Structural Analysis")
+            lines.append("")
+            lines.append("> Semantic classification of code changes between versions.")
+            lines.append("> Git sees text changes; THDSE sees topological changes.")
+            lines.append("")
+            lines.append("| File | Change Type | Description |")
+            lines.append("|------|------------|-------------|")
+            for t in data["temporal_analysis"]:
+                lines.append(
+                    f"| `{t.get('file_id', '?')}` | {t.get('change_type', '?')} "
+                    f"| {t.get('change_description', '')[:80]} |"
+                )
+            lines.append("")
 
         # Dendrogram info
         lines.append("## Hierarchical Clustering")

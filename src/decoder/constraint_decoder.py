@@ -9,6 +9,12 @@ Architecture:
   3. Solve: if SAT → compile model to AST; if UNSAT → trigger Meta-Grammar
      Emergence (dimension expansion or operator fusion) and retry.
 
+Sub-Tree Assembly (LEAP 1):
+  When a SubTreeVocabulary is provided, the decoder uses concrete AST sub-trees
+  harvested from the source corpus instead of abstract placeholder templates.
+  The SMT solver selects which sub-trees to include and in what order,
+  and the compiler assembles them with variable threading.
+
 Algebraic fix (unbinding):
   Given final = ast ⊗ cfg ⊗ data, to recover AST-layer signal:
     recovered_ast = final ⊗ conj(cfg) ⊗ conj(data)
@@ -26,6 +32,7 @@ Strict guarantees:
 """
 
 import ast
+import copy
 import hashlib
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -39,6 +46,8 @@ from src.utils.arena_ops import (
     conjugate_into, negate_phases, bind_bundle_fusion_phases,
     expand_phases, compute_phase_entropy, compute_operation_entropy,
 )
+from src.decoder.subtree_vocab import SubTreeVocabulary, SubTreeAtom
+from src.decoder.variable_threading import thread_variables
 
 
 # ── Structural atoms vocabulary ──────────────────────────────────
@@ -125,6 +134,7 @@ class ConstraintDecoder:
         verification_threshold: float = 0.15,
         max_meta_grammar_retries: int = 0,
         entropy_weight: float = 0.0,
+        subtree_vocab: Optional[SubTreeVocabulary] = None,
     ):
         self.arena = arena
         self.projector = projector
@@ -135,6 +145,7 @@ class ConstraintDecoder:
         self.entropy_weight = entropy_weight
         self._atom_vocab: Dict[str, StructuralAtom] = {}
         self._meta_grammar_log: List[MetaGrammarEvent] = []
+        self._subtree_vocab = subtree_vocab
         self._build_vocabulary()
 
     # ── Vocabulary construction ──────────────────────────────────
@@ -526,7 +537,330 @@ class ConstraintDecoder:
 
         return solver, vars_map
 
-    # ── Phase 3: AST Compilation ─────────────────────────────────
+    # ── Sub-Tree Probing ──────────────────────────────────────────
+
+    def probe_subtrees(
+        self, input_: Union[int, LayeredProjection],
+    ) -> List[Tuple[SubTreeAtom, float]]:
+        """Probe a synthesized vector against the sub-tree vocabulary.
+
+        For each sub-tree atom in the vocabulary, computes correlation
+        with the input vector. Returns atoms exceeding the activation threshold,
+        sorted by descending resonance score.
+
+        Args:
+            input_: Arena handle or LayeredProjection to probe.
+
+        Returns:
+            List of (SubTreeAtom, resonance_score) tuples exceeding threshold.
+        """
+        if self._subtree_vocab is None:
+            return []
+
+        if isinstance(input_, LayeredProjection):
+            target_h = self._recover_layer(input_, "ast")
+        else:
+            target_h = input_
+
+        activated: List[Tuple[SubTreeAtom, float]] = []
+        for atom in self._subtree_vocab.get_projected_atoms():
+            if atom.handle is None:
+                continue
+            corr = self.arena.compute_correlation(target_h, atom.handle)
+            if abs(corr) >= self.activation_threshold:
+                activated.append((atom, corr))
+
+        # Sort by descending absolute resonance
+        activated.sort(key=lambda x: abs(x[1]), reverse=True)
+        return activated
+
+    # ── Sub-Tree SMT Encoding ─────────────────────────────────────
+
+    def encode_smt_subtrees(
+        self,
+        activated_atoms: List[Tuple[SubTreeAtom, float]],
+        entropy_budget: Optional[float] = None,
+    ) -> Tuple[z3.Solver, Dict, List[SubTreeAtom]]:
+        """Encode sub-tree selection and ordering as Z3 constraints.
+
+        For each activated sub-tree atom:
+          - Bool use_subtree_{hash}: whether this sub-tree is included
+          - Int position_{hash}: ordering position in the final AST body
+          - Compatibility constraints between co-positioned sub-trees
+          - Exclusion constraints for same-slot sub-trees
+          - Well-formedness constraints (function header requires body, etc.)
+          - Resonance score maximization via threshold constraint
+
+        Args:
+            activated_atoms: List of (SubTreeAtom, resonance_score) from probing.
+            entropy_budget: Optional entropy ceiling for thermodynamic constraint.
+
+        Returns:
+            Tuple of (solver, vars_map, ordered_atom_list).
+        """
+        solver = z3.Solver()
+        vars_map: Dict[str, Any] = {}
+        atom_list: List[SubTreeAtom] = []
+
+        if not activated_atoms:
+            return solver, vars_map, atom_list
+
+        # Create Z3 variables for each activated sub-tree
+        use_vars: Dict[str, z3.BoolRef] = {}
+        pos_vars: Dict[str, z3.ArithRef] = {}
+        atom_by_hash: Dict[str, Tuple[SubTreeAtom, float]] = {}
+
+        for atom, score in activated_atoms:
+            h = atom.tree_hash[:12]  # shortened hash for readability
+            use_var = z3.Bool(f"use_{h}")
+            pos_var = z3.Int(f"pos_{h}")
+
+            use_vars[atom.tree_hash] = use_var
+            pos_vars[atom.tree_hash] = pos_var
+            atom_by_hash[atom.tree_hash] = (atom, score)
+
+            vars_map[f"use_{h}"] = use_var
+            vars_map[f"pos_{h}"] = pos_var
+
+            # Position bounds: 0..len(activated_atoms)
+            solver.add(z3.Implies(use_var, pos_var >= 0))
+            solver.add(z3.Implies(use_var, pos_var < len(activated_atoms)))
+            solver.add(z3.Implies(z3.Not(use_var), pos_var == -1))
+
+        # Exclusion: same structural slot sub-trees cannot both be active.
+        # Group sub-trees by root type — at most N of same type for reasonable programs.
+        by_root_type: Dict[str, List[str]] = {}
+        for atom, _ in activated_atoms:
+            if atom.root_type not in by_root_type:
+                by_root_type[atom.root_type] = []
+            by_root_type[atom.root_type].append(atom.tree_hash)
+
+        for root_type, hashes in by_root_type.items():
+            if len(hashes) <= 3:
+                continue  # Allow up to 3 of same type
+            # AtMost 3 of same root type can be active
+            solver.add(z3.AtMost(*[use_vars[h] for h in hashes], 3))
+
+        # Distinct positions: no two active sub-trees share a position
+        active_hashes = list(use_vars.keys())
+        for i, h_a in enumerate(active_hashes):
+            for h_b in active_hashes[i + 1:]:
+                solver.add(z3.Implies(
+                    z3.And(use_vars[h_a], use_vars[h_b]),
+                    pos_vars[h_a] != pos_vars[h_b],
+                ))
+
+        # Compatibility: sub-trees sharing variable slots should be co-positioned
+        # (adjacent in output). This is a soft constraint via ordering.
+        for i, h_a in enumerate(active_hashes):
+            atom_a = atom_by_hash[h_a][0]
+            for h_b in active_hashes[i + 1:]:
+                atom_b = atom_by_hash[h_b][0]
+                # If both define/use variables, encourage adjacency
+                if atom_a.is_definition and atom_b.is_use:
+                    solver.add(z3.Implies(
+                        z3.And(use_vars[h_a], use_vars[h_b]),
+                        pos_vars[h_a] < pos_vars[h_b],
+                    ))
+
+        # Well-formedness: if any Return sub-tree is active, ensure a
+        # FunctionDef-rooted sub-tree is also active (or we wrap in one)
+        return_hashes = by_root_type.get("Return", [])
+        funcdef_hashes = by_root_type.get("FunctionDef", [])
+        if return_hashes and funcdef_hashes:
+            for rh in return_hashes:
+                solver.add(z3.Implies(
+                    use_vars[rh],
+                    z3.Or(*[use_vars[fh] for fh in funcdef_hashes]),
+                ))
+
+        # Resonance threshold: total resonance of selected sub-trees
+        # must exceed a minimum to ensure meaningful output
+        resonance_terms = []
+        for h, (atom, score) in atom_by_hash.items():
+            # Scale score to integer (multiply by 1000 for precision)
+            int_score = int(abs(score) * 1000)
+            resonance_terms.append(
+                z3.If(use_vars[h], z3.IntVal(int_score), z3.IntVal(0))
+            )
+
+        if resonance_terms:
+            total_resonance = z3.Int("total_resonance")
+            vars_map["total_resonance"] = total_resonance
+            solver.add(total_resonance == z3.Sum(resonance_terms))
+            # Require at least one sub-tree to be active
+            solver.add(z3.Or(*[use_vars[h] for h in active_hashes]))
+            # Maximize by requiring resonance above minimum meaningful threshold
+            min_resonance = max(40, int(self.activation_threshold * 1000))
+            solver.add(total_resonance >= min_resonance)
+
+        # Entropy budget constraint (thermodynamics)
+        if entropy_budget is not None:
+            depth_cost_terms = []
+            for h, (atom, _) in atom_by_hash.items():
+                depth_cost_terms.append(
+                    z3.If(use_vars[h], z3.IntVal(atom.depth), z3.IntVal(0))
+                )
+            if depth_cost_terms:
+                total_depth = z3.Int("total_depth_cost")
+                vars_map["total_depth_cost"] = total_depth
+                solver.add(total_depth == z3.Sum(depth_cost_terms))
+                solver.add(total_depth <= int(entropy_budget * 2))
+
+        # Collect atom list in hash order for compile_model_subtrees
+        atom_list = [atom_by_hash[h][0] for h in active_hashes]
+
+        return solver, vars_map, atom_list
+
+    # ── Sub-Tree Assembly Compiler ─────────────────────────────────
+
+    def compile_model_subtrees(
+        self,
+        model: z3.ModelRef,
+        vars_map: Dict,
+        atom_list: List[SubTreeAtom],
+    ) -> ast.Module:
+        """Compile a Z3 model into a Python AST by assembling real sub-trees.
+
+        The SAT model tells us WHICH canonical sub-trees to include and in
+        WHAT ORDER. The compiler:
+        1. Collects all use_subtree == True sub-trees from the model
+        2. Sorts by position value
+        3. Deep-copies canonical ASTs and threads variables
+        4. Wraps in FunctionDef or Module as appropriate
+        5. Runs ast.fix_missing_locations() and verifies via compile()
+
+        Args:
+            model: Z3 satisfying model.
+            vars_map: Variable map from encode_smt_subtrees.
+            atom_list: Ordered list of SubTreeAtom candidates.
+
+        Returns:
+            A valid ast.Module node.
+        """
+        # Step 1: Collect active sub-trees with their positions
+        selected: List[Tuple[int, SubTreeAtom]] = []
+        for atom in atom_list:
+            h = atom.tree_hash[:12]
+            use_key = f"use_{h}"
+            pos_key = f"pos_{h}"
+
+            if use_key not in vars_map:
+                continue
+
+            use_val = model.evaluate(vars_map[use_key], model_completion=True)
+            if not z3.is_true(use_val):
+                continue
+
+            pos_val = model.evaluate(vars_map[pos_key], model_completion=True)
+            try:
+                pos_int = pos_val.as_long()
+            except (AttributeError, Exception):
+                pos_int = 0
+
+            selected.append((pos_int, atom))
+
+        if not selected:
+            # Fallback: emit a minimal valid module
+            return ast.Module(body=[ast.Pass()], type_ignores=[])
+
+        # Step 2: Sort by position
+        selected.sort(key=lambda x: (x[0], x[1].root_type))
+
+        # Step 3: Deep-copy canonical ASTs
+        subtree_nodes: List[ast.AST] = []
+        for _, atom in selected:
+            node_copy = copy.deepcopy(atom.canonical_ast)
+            subtree_nodes.append(node_copy)
+
+        # Step 4: Thread variables across sub-trees
+        subtree_nodes = thread_variables(subtree_nodes)
+
+        # Step 5: Assemble into module body
+        body_stmts: List[ast.stmt] = []
+        func_body: List[ast.stmt] = []
+        in_function = False
+        has_funcdef = False
+
+        for node in subtree_nodes:
+            if isinstance(node, ast.FunctionDef):
+                has_funcdef = True
+                in_function = True
+                # We'll wrap subsequent statements as the function body
+                # but keep the function def node's own body
+                if node.body:
+                    body_stmts.append(node)
+                    in_function = False  # function is self-contained
+                else:
+                    # Empty function body — subsequent stmts become body
+                    body_stmts.append(node)
+                continue
+
+            if isinstance(node, ast.stmt):
+                if in_function and body_stmts and isinstance(body_stmts[-1], ast.FunctionDef):
+                    # Add to the last function's body
+                    body_stmts[-1].body.append(node)
+                else:
+                    body_stmts.append(node)
+            elif isinstance(node, ast.expr):
+                # Wrap bare expressions in Expr statement
+                body_stmts.append(ast.Expr(value=node))
+
+        # If we collected statements that should be in a function but aren't,
+        # and Return is among them, wrap in a function
+        has_return = any(
+            isinstance(s, ast.Return) for s in body_stmts
+            if not isinstance(s, ast.FunctionDef)
+        )
+        if has_return and not has_funcdef:
+            # Extract non-function stmts and wrap in synthesized function
+            non_func = [s for s in body_stmts if not isinstance(s, ast.FunctionDef)]
+            if non_func:
+                func_def = ast.FunctionDef(
+                    name="synthesized_fn",
+                    args=ast.arguments(
+                        posonlyargs=[],
+                        args=[ast.arg(arg="x")],
+                        kwonlyargs=[],
+                        kw_defaults=[],
+                        defaults=[],
+                    ),
+                    body=non_func,
+                    decorator_list=[],
+                    returns=None,
+                )
+                func_stmts = [s for s in body_stmts if isinstance(s, ast.FunctionDef)]
+                body_stmts = func_stmts + [func_def]
+
+        if not body_stmts:
+            body_stmts = [ast.Pass()]
+
+        module = ast.Module(body=body_stmts, type_ignores=[])
+        ast.fix_missing_locations(module)
+
+        # Step 6: Verify via compile()
+        try:
+            compile(module, "<synthesized>", "exec")
+        except (SyntaxError, TypeError, ValueError):
+            # If compilation fails, fall through to ensure at least valid AST
+            # by removing problematic nodes one by one
+            safe_body: List[ast.stmt] = []
+            for stmt in body_stmts:
+                test_mod = ast.Module(body=safe_body + [stmt], type_ignores=[])
+                ast.fix_missing_locations(test_mod)
+                try:
+                    compile(test_mod, "<synthesized>", "exec")
+                    safe_body.append(stmt)
+                except (SyntaxError, TypeError, ValueError):
+                    continue
+            if not safe_body:
+                safe_body = [ast.Pass()]
+            module = ast.Module(body=safe_body, type_ignores=[])
+            ast.fix_missing_locations(module)
+
+        return module
+
+    # ── Phase 3: AST Compilation (Legacy) ─────────────────────────
 
     def compile_model(self, model: z3.ModelRef, vars_map: Dict) -> ast.Module:
         """Compile a Z3 satisfying model into a Python AST."""
@@ -865,6 +1199,14 @@ class ConstraintDecoder:
     def decode(self, input_: Union[int, LayeredProjection]) -> Optional[ast.Module]:
         """Full pipeline: probe → encode SMT → solve → compile AST.
 
+        When a SubTreeVocabulary is available, uses sub-tree assembly:
+          1. Probe sub-tree vocabulary for resonating concrete fragments
+          2. Encode sub-tree selection/ordering as Z3 constraints
+          3. Solve → assemble real sub-trees with variable threading
+
+        Falls back to legacy atom-based decoding if no sub-tree vocabulary
+        is configured or if sub-tree assembly fails.
+
         On UNSAT (topological contradiction), triggers Meta-Grammar Emergence:
           1. First attempt: synthesize fused operator and re-probe
           2. Second attempt: expand dimension d → 2d and re-probe
@@ -872,19 +1214,30 @@ class ConstraintDecoder:
 
         Topological Thermodynamics is enforced via entropy constraints in SMT.
         """
-        constraints = self.probe(input_)
-
-        if not constraints.active_node_types:
-            return None
-
         # Compute entropy budget from input signal (thermodynamic ceiling)
         entropy_budget = None
         if isinstance(input_, LayeredProjection) and self.entropy_weight > 0:
             phase_entropy = compute_phase_entropy(input_.ast_phases)
-            # Budget = signal entropy × weight × scale — forces minimum-complexity solution
-            # Scale of 50 provides sufficient headroom for typical programs while
-            # still constraining combinatorial explosion.
             entropy_budget = phase_entropy * self.entropy_weight * 50
+
+        # ── Sub-Tree Assembly Path (LEAP 1) ───────────────────────
+        if self._subtree_vocab is not None and self._subtree_vocab.size() > 0:
+            activated = self.probe_subtrees(input_)
+            if activated:
+                solver_st, vars_st, atom_list = self.encode_smt_subtrees(
+                    activated, entropy_budget=entropy_budget,
+                )
+                result_st = solver_st.check()
+                if result_st == z3.sat:
+                    return self.compile_model_subtrees(
+                        solver_st.model(), vars_st, atom_list,
+                    )
+
+        # ── Legacy Atom-Based Path ────────────────────────────────
+        constraints = self.probe(input_)
+
+        if not constraints.active_node_types:
+            return None
 
         solver, vars_map = self.encode_smt(constraints, entropy_budget=entropy_budget)
 
