@@ -550,6 +550,81 @@ def test_singularity_expansion():
             print(f"         {evt.trigger}: dim {evt.old_dimension}→{evt.new_dimension}, ok={evt.retry_succeeded}")
 
 
+# ── Test 11: Stdlib Discovery Pipeline ──────────────────────────
+
+def test_stdlib_discovery():
+    """Validate the empirical discovery pipeline against Python stdlib.
+
+    Ingests 200+ stdlib modules, computes resonance, and verifies
+    non-trivial structural patterns emerge.
+    """
+    try:
+        import hdc_core
+    except ImportError:
+        print("[SKIP] stdlib discovery (hdc_core not compiled)")
+        return
+
+    import numpy as np
+    from src.projection.isomorphic_projector import IsomorphicProjector
+    from src.synthesis.axiomatic_synthesizer import AxiomaticSynthesizer
+    from src.decoder.constraint_decoder import ConstraintDecoder
+    from src.corpus.ingester import BatchIngester
+    from src.corpus.stdlib_corpus import StdlibCorpus
+    from src.analysis.resonance_analyzer import ResonanceAnalyzer
+
+    dim = 256
+    arena = hdc_core.FhrrArena(2_000_000, dim)
+    projector = IsomorphicProjector(arena, dim)
+    synthesizer = AxiomaticSynthesizer(arena, projector, resonance_threshold=0.15)
+
+    ingester = BatchIngester(synthesizer, verbose=False)
+    stdlib = StdlibCorpus(ingester)
+
+    # Step 1: Ingest at least 200 stdlib modules
+    stats = stdlib.ingest(max_files=500)
+    print(f"       Stdlib ingestion: {stats.summary()}")
+    assert stats.ingested >= 200, (
+        f"Expected at least 200 stdlib modules ingested, got {stats.ingested}"
+    )
+
+    # Step 2: Compute resonance matrix
+    decoder = ConstraintDecoder(arena, projector, dim, activation_threshold=0.04)
+    analyzer = ResonanceAnalyzer(synthesizer, decoder=decoder)
+    mat = analyzer.compute_resonance()
+    res_stats = analyzer.resonance_stats()
+
+    # Assert resonance is not trivially uniform
+    assert res_stats["std"] > 0.01, (
+        f"Resonance std too low ({res_stats['std']:.6f}), matrix may be trivially uniform"
+    )
+    print(f"       Resonance: mean={res_stats['mean']:.6f}, std={res_stats['std']:.6f}")
+
+    # Step 3: Extract cliques
+    fingerprints = analyzer.interpret_cliques(min_size=3)
+    assert len(fingerprints) >= 1, "Expected at least 1 clique of size >= 3"
+    print(f"       Cliques (size >= 3): {len(fingerprints)}")
+
+    # Step 4: Verify fingerprints are non-empty strings
+    for fp in fingerprints:
+        assert isinstance(fp.description, str) and len(fp.description) > 0, (
+            f"Fingerprint description must be a non-empty string, got: {fp.description!r}"
+        )
+
+    # Smoke test: top 5 most resonant pairs
+    top_pairs = analyzer.top_resonant_pairs(k=5)
+    print("       Top 5 most resonant pairs:")
+    for a, b, r in top_pairs:
+        print(f"         {r:.6f}  {a}  <->  {b}")
+
+    # Smoke test: top 3 outliers
+    outliers = analyzer.bottom_resonant_axioms(k=3)
+    print("       Top 3 outliers:")
+    for sid, mr in outliers:
+        print(f"         {mr:.6f}  {sid}")
+
+    print(f"[PASS] stdlib discovery ({stats.ingested} modules, {len(fingerprints)} cliques)")
+
+
 # ── Main ────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -565,4 +640,5 @@ if __name__ == "__main__":
         test_autopoietic_self_reference()
         test_topological_thermodynamics()
         test_singularity_expansion()
+        test_stdlib_discovery()
     print("\nAll applicable tests passed.")
