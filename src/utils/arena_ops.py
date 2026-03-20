@@ -65,3 +65,68 @@ def conjugate_into(arena: Any, phases: List[float], dst_handle: int):
         bind(V, conjugate(V)) ≈ identity (phases ≈ 0, i.e., all-real ≈ 1+0j)
     """
     arena.inject_phases(dst_handle, negate_phases(phases))
+
+
+# ── Meta-Grammar Emergence: Fusion Operator ──────────────────────
+
+def bind_bundle_fusion_phases(
+    phases_bind: List[float], phase_arrays_bundle: List[List[float]]
+) -> List[float]:
+    """Phase-domain fusion: fuse(A, {B₁,...,Bₖ}) = A ⊗ (B₁ ⊕ ... ⊕ Bₖ).
+
+    Computes bundle of phase_arrays_bundle, then binds with phases_bind.
+    This is the new algebraic grammar rule synthesized from ⊗ and ⊕.
+    """
+    bundled = bundle_phases(phase_arrays_bundle)
+    return bind_phases(phases_bind, bundled)
+
+
+# ── Meta-Grammar Emergence: Dimension Expansion ─────────────────
+
+def expand_phases(phases: List[float], new_dim: int) -> List[float]:
+    """Expand a phase vector from dim d to new_dim by conjugate reflection.
+
+    For j in [d, new_dim): new_phase[j] = -phases[j % d]
+    This mirrors the Rust arena's expand_dimension logic exactly.
+    """
+    old_dim = len(phases)
+    if new_dim <= old_dim:
+        return phases[:]
+    extended = phases[:]
+    for j in range(old_dim, new_dim):
+        extended.append(-phases[j % old_dim])
+    return extended
+
+
+# ── Topological Thermodynamics: Entropy Computation ──────────────
+
+def compute_phase_entropy(phases: List[float]) -> float:
+    """Compute the structural entropy of a phase vector.
+
+    Uses the circular variance as a deterministic entropy measure:
+      S = -ln(R) where R = |mean(e^{iθ})|
+
+    R = 1 → all phases aligned → zero entropy (maximally compressed)
+    R → 0 → phases uniformly spread → maximum entropy (maximally complex)
+
+    This is O(d) and deterministic.
+    """
+    arr = np.asarray(phases)
+    mean_re = float(np.mean(np.cos(arr)))
+    mean_im = float(np.mean(np.sin(arr)))
+    R = np.sqrt(mean_re ** 2 + mean_im ** 2)
+    if R < 1e-12:
+        return float(np.log(len(phases)))  # Maximum entropy
+    return float(-np.log(R))
+
+
+def compute_operation_entropy(bind_count: int, bundle_fan_in: int) -> float:
+    """Compute the thermodynamic entropy cost of VSA operations.
+
+    S_ops = bind_count × ln(2) + bundle_fan_in × ln(2)
+
+    Each bind doubles the algebraic complexity (ln(2) per bind).
+    Each bundle fan-in adds ln(2) per superposed vector.
+    """
+    ln2 = float(np.log(2.0))
+    return bind_count * ln2 + bundle_fan_in * ln2
