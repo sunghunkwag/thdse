@@ -20,7 +20,7 @@ async def bootstrap_thdse():
         print("Fatal: hdc_core compilation barrier reached.")
         return
 
-    arena = hdc_core.FhrrArena(2000, 10000)
+    arena = hdc_core.FhrrArena(100000, 10000)
     encoder = TopologicalEncoder(arena, 10000)
     axiom_engine = AutoAxiomatizationEngine(encoder)
     prophet = TheProphet(in_channels=16, hidden_channels=32)

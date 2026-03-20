@@ -94,7 +94,9 @@ impl FhrrArena {
         }
         Ok(sum_real / (self.dimension as f32))
     }
+}
 
+impl FhrrArena {
     #[target_feature(enable = "avx2", enable = "fma")]
     unsafe fn bind_simd(&mut self, h1: usize, h2: usize, out_handle: usize) -> PyResult<()> {
         self.validate_handles(&[h1, h2, out_handle])?;
