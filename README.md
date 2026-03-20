@@ -13,22 +13,33 @@ A strictly deterministic architecture that mathematically synthesizes new code s
          ▼                        ▼                          │
 ┌─────────────────┐      ┌──────────────────┐      ┌────────┴────────┐
 │   TOPOLOGY       │      │   PROJECTION      │      │   DECODER        │
-│   AST + CFG +    │─────▶│   Graph → FHRR    │      │   VSA → SMT → AST│
-│   Data-Dep Graph │      │   Hypervector     │      │   (Z3 Solver)    │
-└─────────────────┘      └────────┬─────────┘      └────────▲────────┘
-                                  │                          │
-                                  ▼                          │
-                         ┌──────────────────┐               │
-                         │   SYNTHESIS       │───────────────┘
-                         │   Phase Transition│
-                         │   bind(A_i ⊗ A_j) │
-                         └──────────────────┘
-                                  │
-                         ┌────────▼─────────┐
-                         │   HDC_CORE (Rust) │
-                         │   FHRR Arena      │
-                         │   AVX2 SIMD       │
-                         └──────────────────┘
+│   AST + CFG +    │─────▶│   Graph → FHRR    │─┐   │   VSA → SMT → AST│
+│   Data-Dep Graph │      │   Hypervector     │ │   │   (Z3 Solver)    │
+└─────────────────┘      └──────────────────┘ │   └────────▲────────┘
+                                               │            │
+                                               ▼            │
+                                      ┌──────────────────┐ │
+                                      │   SYNTHESIS       │─┘
+                                      │   Phase Transition│
+                                      │   bind(A_i ⊗ A_j) │
+                                      └──────────────────┘
+                                               │
+                                      ┌────────▼─────────┐
+                                      │   HDC_CORE (Rust) │
+                                      │   FHRR Arena      │
+                                      │   AVX2 SIMD       │
+                                      └──────────────────┘
+
+                         ┌──────────────────────────────────┐
+                         │   PHASE TRANSITION MECHANISMS     │
+                         │                                   │
+                         │ 1. Quotient Space Folding         │
+                         │    H → H / ⟨V_error⟩             │
+                         │ 2. Operator Fusion                │
+                         │    A ⊗ (B₁ ⊕ … ⊕ Bₖ)           │
+                         │ 3. Dimension Expansion            │
+                         │    d → 2d (conjugate reflection)  │
+                         └──────────────────────────────────┘
 
                          ┌──────────────────┐
                          │   DISCOVERY       │
@@ -57,6 +68,8 @@ Rust library (PyO3 bindings) implementing an FHRR memory arena:
 - `expand_dimension(new_dim)` → meta-grammar emergence via conjugate reflection
 - `bind_bundle_fusion(h, handles, out)` → fused algebraic operator A ⊗ (B₁ ⊕ … ⊕ Bₖ)
 - `compute_entropy(h)` → thermodynamic cost S(h) = n_bind·ln2 + n_bundle·ln2
+- `project_to_quotient_space(v_error_id)` → orthogonal projection H → H/⟨V_error⟩, AVX2 SIMD
+- `extract_phases(handle)` → read back phase angles from arena slot
 
 ### 3. Projection (`src/projection/`)
 **Isomorphic Projector**: maps the 3-layer graph into a single holographic hypervector.
@@ -64,6 +77,7 @@ Rust library (PyO3 bindings) implementing an FHRR memory arena:
 - Data-dep sets → bundle (⊕) preserving membership
 - AST identity → bind(type ⊗ position ⊗ CA-state)
 - Final: bind all three layer vectors into one hologram
+- **Contradiction Vector Synthesis**: given a set of conflicting atom handles from the UNSAT core, algebraically combines them via bind/bundle to produce a single V_error encoding the exact axis of topological contradiction
 
 ### 4. Synthesis (`src/synthesis/`)
 **Axiomatic Synthesizer**: deterministic phase-transition engine.
@@ -81,8 +95,36 @@ Additional capabilities:
 ### 5. Decoder (`src/decoder/`)
 **Constraint Decoder**: translates synthesized hypervectors back to code via Z3.
 1. **Probe**: correlate against a vocabulary of structural atoms (node types, CFG patterns, data-dep signatures), with layer-aware unbinding for algebraically correct signal recovery
-2. **Encode**: translate activated atoms into Z3 formulas (reachability, ordering, well-formedness), with optional thermodynamic entropy ceiling
-3. **Solve**: if SAT → compile model to Python AST; if UNSAT → trigger meta-grammar emergence (fusion operator synthesis or dimension expansion) before rejecting
+2. **Encode**: translate activated atoms into Z3 formulas (reachability, ordering, well-formedness), with optional thermodynamic entropy ceiling and UNSAT core tracking via `assert_and_track`
+3. **Solve**: if SAT → compile model to Python AST; if UNSAT → trigger Phase Transition cascade:
+
+#### Phase Transition Cascade (UNSAT Resolution)
+
+When the Z3 solver determines that the probed topological constraints form an unsatisfiable system, the decoder initiates a strictly ordered cascade of deterministic resolution mechanisms:
+
+**Phase 1 — Dynamic Null Space Projection (Quotient Space Folding)**
+
+The algebraically cheapest resolution: no dimension change, no re-projection required.
+
+1. **UNSAT Core Extraction**: Z3's `unsat_core()` isolates the minimal subset of conflicting constraints. Each constraint is tracked via `assert_and_track` with labels corresponding to structural atom vocabulary keys (e.g., `atom:cfg_seq:If→Return`).
+2. **Reverse Lookup**: the extracted core labels are mapped back to their corresponding hypervector handles in the hdc_core arena, recovering the exact set of conflicting structural atoms.
+3. **Contradiction Vector Synthesis**: the conflicting atom handles are algebraically combined into a single Contradiction Vector V_error:
+   - For |core| = 1: V_error = atom₁
+   - For |core| = 2: V_error = atom₁ ⊗ atom₂
+   - For |core| ≥ 3: V_error = atom₁ ⊗ (atom₂ ⊕ … ⊕ atomₖ) via the fusion operator
+4. **Orthogonal Projection**: the entire arena is projected to the quotient space H/⟨V_error⟩ by annihilating the component parallel to V_error from every live hypervector:
+
+$$
+X' = X - V_{\text{error}} \cdot \frac{V_{\text{error}}^H \cdot X}{V_{\text{error}}^H \cdot V_{\text{error}}}
+$$
+
+   This is implemented in Rust with AVX2 SIMD acceleration (two-pass: scalar inner product, SIMD subtraction + re-normalization). The projection is performed in-place with O(head × dimension) complexity and zero auxiliary allocation. Each component is re-normalized to unit magnitude to preserve the FHRR invariant |z_j| = 1.
+
+5. **Re-probe and Re-solve**: the folded projection is re-probed against the (now algebraically modified) atom vocabulary, and the resulting constraints are submitted to a fresh Z3 solver instance.
+
+**Phase 2 — Operator Fusion**: synthesize fuse(ast, [cfg, data]) = ast ⊗ (cfg ⊕ data), collapsing cross-layer interference via a novel algebraic grammar rule.
+
+**Phase 3 — Dimension Expansion**: expand the representational capacity d → 2d via deterministic conjugate reflection, then rebuild the vocabulary and re-probe at the higher dimension.
 
 ### 6. Corpus Ingestion (`src/corpus/`)
 **Batch Ingester**: scalable pipeline for processing directories of Python projects into VSA space.
@@ -174,7 +216,7 @@ cd src/hdc_core && maturin develop --release && cd ../..
 # Install Python dependencies
 pip install -r requirements.txt
 
-# Run full test suite (11 tests including stdlib discovery)
+# Run full test suite (12 tests including quotient space folding and stdlib discovery)
 python run_tests.py
 
 # Run the empirical discovery pipeline against stdlib
@@ -206,3 +248,4 @@ Notable findings:
 - **Compositionality**: bind (⊗) preserves ordering, bundle (⊕) preserves membership — both are algebraically exact in FHRR.
 - **Thermodynamic ordering**: synthesized structures are ranked by entropy S(h) = n_bind·ln 2 + n_bundle·ln 2, enabling principled selection of minimum-complexity solutions.
 - **Meta-grammar emergence**: on UNSAT, the decoder deterministically synthesizes new algebraic operators (fusion) or expands the representational dimension (d → 2d via conjugate reflection) to resolve contradictions.
+- **Quotient space correctness**: the orthogonal projection X' = X − V·(V^H·X)/(V^H·V) annihilates exactly the one-dimensional subspace spanned by V_error. The resulting quotient space H/⟨V_error⟩ preserves all pairwise correlations that are orthogonal to the contradiction axis, ensuring that structurally valid relationships remain undistorted after folding. Post-projection re-normalization to unit magnitude per component maintains the FHRR representational invariant.
