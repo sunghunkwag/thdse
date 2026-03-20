@@ -26,6 +26,7 @@ Mathematical foundation:
       S_final = S_ast ⊗ S_cfg ⊗ S_data
 """
 
+import json
 import os
 from typing import Any, Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
@@ -287,6 +288,12 @@ class AxiomaticSynthesizer:
     _SELF_SOURCE_FILES = [
         "src/projection/isomorphic_projector.py",
         "src/decoder/constraint_decoder.py",
+        "src/decoder/subtree_vocab.py",
+        "src/decoder/variable_threading.py",
+        "src/analysis/structural_diff.py",
+        "src/analysis/refactoring_detector.py",
+        "src/analysis/temporal_diff.py",
+        "src/synthesis/axiomatic_synthesizer.py",
         "src/hdc_core/src/lib.rs",
     ]
 
@@ -457,11 +464,261 @@ class AxiomaticSynthesizer:
         results.sort(key=lambda x: x[2])
         return results
 
+    # ── Self-Diagnostic via Structural Analysis (LEAP 3A) ────────
+
+    def run_self_diagnostic(
+        self, project_root: Optional[str] = None, output_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Run structural analysis on the engine's own modules.
+
+        After ingesting self-source files:
+        1. Compute per-layer similarity between each self-source-file pair
+        2. Identify structural duplicates (candidates for internal refactoring)
+        3. Identify structural outliers (most novel / fragile components)
+        4. Output a self_diagnostic.json with actionable findings
+
+        Args:
+            project_root: Root directory of the project. Auto-detected if None.
+            output_path: Directory to write self_diagnostic.json. If None, returns
+                        the dict without writing.
+
+        Returns:
+            Dictionary with self-diagnostic findings.
+        """
+        from src.analysis.structural_diff import StructuralDiffEngine
+
+        if project_root is None:
+            project_root = os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)
+            )))
+
+        # Ingest self if not already done
+        self_axioms = self.ingest_self(project_root)
+        if len(self_axioms) < 2:
+            return {"error": "Insufficient self-axioms for diagnostic"}
+
+        self.compute_resonance()
+        self_ids = [a.source_id for a in self_axioms]
+
+        diff_engine = StructuralDiffEngine(self.arena, self.projector)
+
+        # Pairwise layer-decomposed similarity
+        pairwise: List[Dict[str, Any]] = []
+        duplicates: List[Dict[str, Any]] = []
+        outlier_scores: Dict[str, List[float]] = {sid: [] for sid in self_ids}
+
+        for i, id_a in enumerate(self_ids):
+            axiom_a = self.store.get(id_a)
+            if axiom_a is None:
+                continue
+            for id_b in self_ids[i + 1:]:
+                axiom_b = self.store.get(id_b)
+                if axiom_b is None:
+                    continue
+
+                layer_sim = diff_engine.compare_layers(
+                    axiom_a.projection, axiom_b.projection,
+                )
+
+                pair_data = {
+                    "file_a": id_a,
+                    "file_b": id_b,
+                    "sim_ast": round(layer_sim.sim_ast, 6),
+                    "sim_cfg": round(layer_sim.sim_cfg, 6) if layer_sim.sim_cfg is not None else None,
+                    "sim_data": round(layer_sim.sim_data, 6) if layer_sim.sim_data is not None else None,
+                    "sim_final": round(layer_sim.sim_final, 6),
+                    "diagnosis": layer_sim.diagnosis,
+                }
+                pairwise.append(pair_data)
+
+                # Track for outlier detection
+                outlier_scores[id_a].append(abs(layer_sim.sim_final))
+                outlier_scores[id_b].append(abs(layer_sim.sim_final))
+
+                # Detect structural duplicates
+                if (abs(layer_sim.sim_ast) > 0.7
+                    and layer_sim.sim_cfg is not None
+                    and abs(layer_sim.sim_cfg) > 0.7):
+                    duplicates.append({
+                        "file_a": id_a,
+                        "file_b": id_b,
+                        "sim_ast": round(layer_sim.sim_ast, 6),
+                        "sim_cfg": round(layer_sim.sim_cfg, 6),
+                        "recommendation": "Internal structural duplicate — consider refactoring",
+                    })
+
+        # Identify outliers (lowest mean similarity = most unique/fragile)
+        outlier_means = {}
+        for sid, scores in outlier_scores.items():
+            if scores:
+                outlier_means[sid] = sum(scores) / len(scores)
+
+        sorted_outliers = sorted(outlier_means.items(), key=lambda x: x[1])
+
+        diagnostic = {
+            "self_source_files": self_ids,
+            "total_self_axioms": len(self_axioms),
+            "pairwise_layer_similarity": pairwise,
+            "structural_duplicates": duplicates,
+            "structural_outliers": [
+                {
+                    "file": sid,
+                    "mean_similarity": round(score, 6),
+                    "assessment": "Most structurally unique (potentially novel or fragile)"
+                    if idx < 2 else "Moderate structural uniqueness",
+                }
+                for idx, (sid, score) in enumerate(sorted_outliers)
+            ],
+            "recommendations": [],
+        }
+
+        if duplicates:
+            diagnostic["recommendations"].append(
+                f"Found {len(duplicates)} internal structural duplicate(s). "
+                f"Consider extracting shared patterns into utility modules."
+            )
+
+        if sorted_outliers:
+            most_unique = sorted_outliers[0][0]
+            diagnostic["recommendations"].append(
+                f"Most structurally unique module: {most_unique}. "
+                f"This component is most different from all others — "
+                f"review for potential fragility or innovative patterns."
+            )
+
+        if output_path is not None:
+            os.makedirs(output_path, exist_ok=True)
+            filepath = os.path.join(output_path, "self_diagnostic.json")
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(diagnostic, f, indent=2, ensure_ascii=False)
+
+        return diagnostic
+
+    # ── Synthesis Quality Self-Test (LEAP 3B) ────────────────────
+
+    def run_synthesis_quality_test(
+        self, decoder: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Closed-loop quality test: synthesize → decode → re-project → measure fidelity.
+
+        After the decoder overhaul (LEAP 1):
+        1. Synthesize a novel vector from self-axioms
+        2. Decode it via the sub-tree assembly decoder
+        3. Re-project the decoded output
+        4. Compute round-trip fidelity (cosine similarity)
+        5. If fidelity < threshold, identify which sub-tree atoms were lost
+
+        This is a self-contained quality signal requiring no external evaluation.
+
+        Args:
+            decoder: ConstraintDecoder instance (must have sub-tree vocab for
+                    meaningful results). If None, skips decode step.
+
+        Returns:
+            Dictionary with round-trip fidelity metrics.
+        """
+        result: Dict[str, Any] = {
+            "synthesis_completed": False,
+            "decode_completed": False,
+            "round_trip_fidelity": None,
+            "fidelity_above_threshold": False,
+        }
+
+        # Step 1: Synthesize from self-axioms
+        synth_result = self.synthesize_self_representation()
+        if synth_result is None:
+            result["error"] = "Self-synthesis failed: insufficient axioms"
+            return result
+
+        self_ids, synth_proj = synth_result
+        result["synthesis_completed"] = True
+        result["synthesis_members"] = self_ids
+        result["synthesis_entropy"] = self.compute_synthesis_entropy(synth_proj)
+
+        if decoder is None:
+            result["note"] = "No decoder provided — skipping decode step"
+            return result
+
+        # Step 2: Decode via the constraint decoder
+        try:
+            import ast as ast_mod
+            decoded_module = decoder.decode(synth_proj)
+            if decoded_module is None:
+                result["error"] = "Decode returned None"
+                return result
+
+            decoded_source = ast_mod.unparse(decoded_module)
+            result["decode_completed"] = True
+            result["decoded_source_length"] = len(decoded_source)
+        except Exception as e:
+            result["error"] = f"Decode failed: {str(e)}"
+            return result
+
+        # Step 3: Re-project the decoded output
+        try:
+            reprojected = self.projector.project(decoded_source)
+        except Exception as e:
+            result["error"] = f"Re-projection failed: {str(e)}"
+            return result
+
+        # Step 4: Compute round-trip fidelity
+        fidelity = self.arena.compute_correlation(
+            synth_proj.final_handle, reprojected.final_handle,
+        )
+        result["round_trip_fidelity"] = round(fidelity, 6)
+
+        # Per-layer fidelity
+        ast_fidelity = self.arena.compute_correlation(
+            synth_proj.ast_handle, reprojected.ast_handle,
+        )
+        result["ast_fidelity"] = round(ast_fidelity, 6)
+
+        if synth_proj.cfg_handle is not None and reprojected.cfg_handle is not None:
+            cfg_fidelity = self.arena.compute_correlation(
+                synth_proj.cfg_handle, reprojected.cfg_handle,
+            )
+            result["cfg_fidelity"] = round(cfg_fidelity, 6)
+
+        if synth_proj.data_handle is not None and reprojected.data_handle is not None:
+            data_fidelity = self.arena.compute_correlation(
+                synth_proj.data_handle, reprojected.data_handle,
+            )
+            result["data_fidelity"] = round(data_fidelity, 6)
+
+        # Step 5: Assess fidelity threshold
+        fidelity_threshold = 0.3
+        result["fidelity_above_threshold"] = fidelity >= fidelity_threshold
+        result["fidelity_threshold"] = fidelity_threshold
+
+        if fidelity < fidelity_threshold:
+            result["diagnosis"] = (
+                f"Round-trip fidelity ({fidelity:.4f}) below threshold "
+                f"({fidelity_threshold}). The decoder vocabulary may have gaps — "
+                f"sub-tree atoms in the synthesized vector were lost during decoding."
+            )
+        else:
+            result["diagnosis"] = (
+                f"Round-trip fidelity ({fidelity:.4f}) above threshold "
+                f"({fidelity_threshold}). Decoder faithfully reconstructs "
+                f"synthesized structural patterns."
+            )
+
+        return result
+
     # ── Diagnostics ──────────────────────────────────────────────
 
     def verify_quasi_orthogonality(
         self, synth_handle: int, clique: List[str]
     ) -> Dict[str, float]:
+        """Compute correlation between a synthesized handle and clique members.
+
+        Args:
+            synth_handle: Arena handle of the synthesized vector.
+            clique: List of source IDs in the clique.
+
+        Returns:
+            Dictionary mapping source ID to correlation value.
+        """
         return {
             sid: self.arena.compute_correlation(synth_handle, self.store.axioms[sid].handle)
             for sid in clique
