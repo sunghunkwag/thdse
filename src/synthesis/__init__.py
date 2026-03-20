@@ -1,1 +1,1 @@
-from .axiomatic_synthesizer import AxiomaticSynthesizer, AxiomStore, ResonanceMatrix
+from .axiomatic_synthesizer import AxiomaticSynthesizer, AxiomStore, ResonanceMatrix, Axiom
