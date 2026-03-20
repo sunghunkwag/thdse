@@ -1,13 +1,90 @@
 import httpx
 import ast
 
-class InfiniteLoopPatcher(ast.NodeTransformer):
+class RuleBasedASTPatcher(ast.NodeTransformer):
     def __init__(self, typist_id: int):
         self.typist_id = typist_id
+
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        self.generic_visit(node)
+        
+        # Detect: missing recursion base case
+        func_name = node.name
+        is_recursive = False
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name) and child.func.id == func_name:
+                is_recursive = True
+                break
+                
+        if is_recursive:
+            has_base_case = any(isinstance(stmt, ast.If) for stmt in node.body)
+            if not has_base_case and node.args.args:
+                first_arg = node.args.args[0].arg
+                base_case = ast.If(
+                    test=ast.Compare(
+                        left=ast.Name(id=first_arg, ctx=ast.Load()),
+                        ops=[ast.LtE()],
+                        comparators=[ast.Constant(value=1)]
+                    ),
+                    body=[ast.Return(value=ast.Constant(value=1))],
+                    orelse=[]
+                )
+                node.body.insert(0, base_case)
+                
+        return node
+
+    def visit_Subscript(self, node: ast.Subscript):
+        self.generic_visit(node)
+        
+        # Detect: off-by-one in list indexing - return lst[len(lst)]
+        if isinstance(node.slice, ast.Call) and isinstance(node.slice.func, ast.Name) and node.slice.func.id == 'len':
+            if len(node.slice.args) == 1 and isinstance(node.slice.args[0], ast.Name) and isinstance(node.value, ast.Name):
+                if node.slice.args[0].id == node.value.id:
+                    node.slice = ast.BinOp(
+                        left=node.slice,
+                        op=ast.Sub(),
+                        right=ast.Constant(value=1)
+                    )
+        return node
+
+    def visit_Return(self, node: ast.Return):
+        self.generic_visit(node)
+        
+        # Detect: attribute access chains with no None guard
+        if node.value is None:
+            return node
+            
+        bases = set()
+        for child in ast.walk(node.value):
+            if isinstance(child, ast.Attribute):
+                curr = child
+                while isinstance(curr, ast.Attribute) or isinstance(curr, ast.Call):
+                    if isinstance(curr, ast.Call):
+                        curr = curr.func
+                    elif isinstance(curr, ast.Attribute):
+                        curr = curr.value
+                if isinstance(curr, ast.Name):
+                    bases.add(curr.id)
+                    
+        if bases:
+            base_var = list(bases)[0]
+            guard = ast.If(
+                test=ast.Compare(
+                    left=ast.Name(id=base_var, ctx=ast.Load()),
+                    ops=[ast.IsNot()],
+                    comparators=[ast.Constant(value=None)]
+                ),
+                body=[node],
+                orelse=[]
+            )
+            return guard
+            
+        return node
 
     def visit_While(self, node: ast.While):
         self.generic_visit(node)
         
+        # Detect: infinite loops
         loop_vars = set()
         for child in ast.walk(node.test):
             if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
@@ -55,7 +132,7 @@ class LLM_Typist:
     def _rule_based_fallback(self, base_code: str) -> str:
         try:
             tree = ast.parse(base_code)
-            patcher = InfiniteLoopPatcher(self.typist_id)
+            patcher = RuleBasedASTPatcher(self.typist_id)
             patched_tree = patcher.visit(tree)
             ast.fix_missing_locations(patched_tree)
             return ast.unparse(patched_tree)
