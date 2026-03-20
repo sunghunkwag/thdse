@@ -1,5 +1,0 @@
-C:\Users\starg\OneDrive\바탕 화면\thdse\target\release\build\syn-a0cbfc2303ebee57\build_script_build-a0cbfc2303ebee57.d: C:\Users\starg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\syn-1.0.109\build.rs
-
-C:\Users\starg\OneDrive\바탕 화면\thdse\target\release\build\syn-a0cbfc2303ebee57\build_script_build-a0cbfc2303ebee57.exe: C:\Users\starg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\syn-1.0.109\build.rs
-
-C:\Users\starg\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\syn-1.0.109\build.rs:
