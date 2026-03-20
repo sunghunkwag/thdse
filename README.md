@@ -1,67 +1,58 @@
-# Topological-Holographic Dynamic Swarm Engine (THDSE)
+# THDSE — Core Infrastructure Modules
 
-A deterministic, non-statistical framework for autonomous software engineering through Recursive Self-Improvement (RSI), grounded in Vector Symbolic Architectures (VSA) and algebraic topology.
+Two deterministic, mathematical core modules extracted from the original THDSE repository. All probabilistic, swarm-based, and LLM-dependent modules have been permanently purged.
 
-## Architecture
+## Module 1: High-Speed Topological Computing Engine (`src/hdc_core/`)
 
-The engine operates as a strict mathematical pipeline comprising five stages:
+A pure Rust library (with PyO3 bindings) implementing an FHRR (Fourier Holographic Reduced Representation) memory arena for Vector Symbolic Architecture operations:
 
-1. **Topological AST Graph Construction** — Source code is parsed into an Abstract Syntax Tree via Python's `ast` module and projected onto a directed graph with three edge layers: structural (AST parent-child), control-flow (CFG sequential/branch edges), and data-dependency (def-use chains).
+- **Allocate** complex hypervectors in a zero-GC contiguous arena
+- **Inject** phase vectors to initialize hypervector slots
+- **Bind** two hypervectors via O(1) complex element-wise multiplication (AVX2 SIMD)
+- **Bundle** multiple hypervectors via superposition + unit-magnitude normalization (AVX2 SIMD)
+- **Correlate** two hypervectors via cosine similarity in the complex domain
 
-2. **Holographic Hypervector Encoding** — Each graph node is mapped to a 1024-dimensional complex FHRR (Fourier Holographic Reduced Representation) hypervector via element-wise phase binding and bundling, executed through a custom Rust AVX2 SIMD arena with zero garbage-collection overhead.
+This module is a standalone VSA engine suitable for use in any external meta-architecture requiring high-throughput hyperdimensional computing.
 
-3. **Autophagic Swarm Mutation** — A pool of 20–100 concurrent typists generates candidate code mutations. In the V2 pipeline, a two-phase strategy is employed: Phase 1 performs undirected mutation; Phase 2 injects resonance feedback (per-axiom similarity scores projected into natural-language constraints) to steer subsequent mutations away from known bug signatures.
+## Module 2: Multi-Layer Structure Dissector (`src/topology/`)
 
-4. **Axiom Vector Database & Auto-Axiomatization** — Bug signatures are stored as phase-difference vectors. The V2 engine supports unsupervised axiom discovery: given `(buggy, fixed)` code pairs, novel divergence vectors are automatically mined and registered when their cosine distance from existing axioms exceeds a novelty threshold.
+A pure Python preprocessing tool that decomposes source code into a multi-layer directed graph:
 
-5. **Holographic Verification & Collapse** — All surviving mutations are superimposed in the FHRR arena. The candidate with the lowest maximum resonance against all known axioms (i.e., the vector most distant from every known bug signature) is selected as the output.
+- **`TopologicalASTGraphCA`** — Parses source code into an AST-based directed graph with complex-valued node states evolved via a cellular automaton message-passing scheme.
+- **`MultiLayerGraphBuilder`** — Extends the AST graph with two additional edge layers:
+  - **CFG** (Control Flow Graph): sequential flow, branch targets, loop back-edges
+  - **Data-Dep** (Data Dependency): lightweight def-use chains within scope
 
-## Experimental Results
-
-### Protocol
-
-Three canonical Python bug patterns were tested using the offline rule-based AST mutation backend (no external LLM API required). Each test instantiates an independent FHRR arena (`dim=1024, capacity=50,000`) and executes the full V2 Resonance-Guided Autophagy pipeline.
-
-### Results
-
-| Bug Pattern | Input | Output | Detection Mechanism |
-|---|---|---|---|
-| Off-by-one indexing | `lst[len(lst)]` | `lst[len(lst) - 1]` | `ast.Subscript` analysis: index expression matches `len(collection)` on same variable |
-| Null dereference | `user.name.upper()` | `if user is not None: return user.name.upper()` | `ast.Return` → `ast.Attribute` chain traversal to identify unguarded root variables |
-| Missing recursion base case | `return n * factorial(n-1)` | `if n <= 1: return 1` inserted | `ast.FunctionDef` self-call detection without preceding `ast.If` guard |
-
-All three bugs were detected and patched autonomously (Exit code 0) through deterministic AST analysis combined with HDC vector-space filtering.
-
-### V1 → V2 Improvements
-
-| Metric | V1 | V2 |
-|---|---|---|
-| Graph edge layers | 1 (AST only) | 3 (AST + CFG + Data-Dep) |
-| Axiom registration | Manual | Unsupervised mining from `(buggy, fixed)` pairs |
-| Mutation strategy | Blind brute-force (100 typists) | Two-phase resonance-guided (20 typists) |
-| Axioms auto-mined from 3 seed pairs | 0 | 3 |
-
-## Limitations
-
-The current system operates on **syntactic topology** and cannot detect bugs that require runtime value reasoning (e.g., type-dependent invariants, concurrency hazards). The rule-based AST fallback is pattern-matched; generalization to unseen bug morphologies requires either LLM integration or expansion of the `NodeTransformer` visitor set.
+No encoding logic, no swarm coupling. Pure deterministic graph construction.
 
 ## Project Structure
 
 ```
 thdse/
 ├── src/
-│   ├── hdc_core/          # Rust FHRR Arena (AVX2 SIMD, PyO3 bindings)
-│   ├── topology/           # AST graph builder, V1/V2 encoders
-│   ├── axioms/             # Axiom vector DB, V1/V2 engines
-│   ├── prophet/            # GNN structural anomaly detector
-│   ├── scribe/             # LLM typist + offline AST patcher
-│   └── swarm/              # V1/V2 orchestrators
-├── scripts/                # Entry-point pipeline scripts
+│   ├── hdc_core/              # Rust FHRR Arena (AVX2 SIMD, PyO3 bindings)
+│   │   ├── Cargo.toml
+│   │   └── src/lib.rs
+│   └── topology/              # Multi-layer graph builder + CA
+│       ├── ast_graph_ca.py
+│       └── multi_layer_builder.py
+├── run_tests.py
+├── requirements.txt
 └── Cargo.toml
 ```
 
 ## Dependencies
 
-- **Rust**: `pyo3`, `std::arch::x86_64` (AVX2)
-- **Python**: `ast`, `networkx`, `numpy`, `torch`, `torch-geometric`, `httpx`, `asyncio`
-- **Build**: `maturin`
+- **Rust**: `pyo3 0.18` (PyO3 extension module), `std::arch::x86_64` (AVX2/FMA intrinsics)
+- **Python**: `networkx >= 3.1`, `numpy >= 1.24.0`
+- **Build**: `maturin` (for compiling `hdc_core` as a Python extension)
+
+## Usage
+
+```bash
+# Build the Rust VSA engine
+cd src/hdc_core && maturin develop --release && cd ../..
+
+# Run smoke tests
+python run_tests.py
+```

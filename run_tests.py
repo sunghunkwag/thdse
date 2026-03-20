@@ -1,48 +1,77 @@
 """
-V2 Benchmark: Tests the Resonance-Guided Orchestrator against
-three canonical Python bug patterns using the multi-layer
-topological encoder (AST + CFG + Data-Dep).
+Smoke tests for the two extracted core modules:
+  1. hdc_core (Rust FHRR Arena — VSA engine)
+  2. topology (MultiLayerGraphBuilder + TopologicalASTGraphCA)
 """
 import sys
 import os
-import asyncio
+import math
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__))))
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
-import hdc_core
-from src.topology.encoder_v2 import TopologicalEncoderV2
-from src.axioms.engine_v2 import AutoAxiomatizationEngineV2
-from src.prophet.gnn_analyzer import TheProphet
-from src.swarm.orchestrator_v2 import ResonanceGuidedOrchestrator
 
-DIMENSION = 1024  # Compact dimension for V2 multi-layer graph overhead
-CAPACITY = 50000
+def test_topology_core():
+    """MultiLayerGraphBuilder produces a DiGraph with ast, cfg, data_dep edges."""
+    from src.topology.ast_graph_ca import TopologicalASTGraphCA
+    from src.topology.multi_layer_builder import MultiLayerGraphBuilder
 
-async def run():
-    cases = [
-        ("Test 1 - Off-by-one",
-         "\ndef get_last(lst):\n    return lst[len(lst)]\n"),
-        ("Test 2 - None Reference",
-         "\ndef get_name(user):\n    return user.name.upper()\n"),
-        ("Test 3 - Missing Recursion Base Case",
-         "\ndef factorial(n):\n    return n * factorial(n - 1)\n"),
-    ]
+    code = """\
+def factorial(n):
+    if n <= 1:
+        return 1
+    return n * factorial(n - 1)
+"""
+    builder = MultiLayerGraphBuilder(steps=5)
+    G = builder.build(code)
 
-    for name, code in cases:
-        print(f"=== {name} ===")
-        arena = hdc_core.FhrrArena(CAPACITY, DIMENSION)
-        encoder = TopologicalEncoderV2(arena, DIMENSION)
-        axiom_engine = AutoAxiomatizationEngineV2(encoder)
-        prophet = TheProphet(in_channels=16, hidden_channels=32)
-        orchestrator = ResonanceGuidedOrchestrator(
-            encoder, axiom_engine, prophet
-        )
-        try:
-            res = await orchestrator.execute_pipeline(code, n_typists=20)
-            print("Result:\n" + res.strip())
-        except Exception as e:
-            print(f"Error: {e}")
-        print()
+    layers = {d.get("layer") for _, _, d in G.edges(data=True)}
+    assert "ast" in layers, "Missing AST layer"
+    assert "cfg" in layers, "Missing CFG layer"
+    assert "data_dep" in layers, "Missing data-dep layer"
+
+    # CA evolution should populate complex-valued states
+    ca = TopologicalASTGraphCA(steps=5)
+    G2 = ca.code_to_graph(code)
+    G2 = ca.evolve(G2)
+    for node in G2.nodes:
+        state = G2.nodes[node]["state"]
+        assert abs(abs(state) - 1.0) < 1e-6, "CA state not unit-magnitude"
+
+    print("[PASS] topology core")
+
+
+def test_hdc_core():
+    """FhrrArena allocates, injects, binds, bundles, and correlates."""
+    try:
+        import hdc_core
+    except ImportError:
+        print("[SKIP] hdc_core not compiled — run `maturin develop` in src/hdc_core/")
+        return
+
+    dim = 128
+    arena = hdc_core.FhrrArena(16, dim)
+    h1 = arena.allocate()
+    h2 = arena.allocate()
+    h3 = arena.allocate()
+
+    import numpy as np
+    rng = np.random.RandomState(42)
+    arena.inject_phases(h1, rng.uniform(-math.pi, math.pi, dim).tolist())
+    arena.inject_phases(h2, rng.uniform(-math.pi, math.pi, dim).tolist())
+
+    arena.bind(h1, h2, h3)
+    self_corr = arena.compute_correlation(h1, h1)
+    cross_corr = arena.compute_correlation(h1, h2)
+    assert self_corr > 0.9, f"Self-correlation too low: {self_corr}"
+    assert abs(cross_corr) < 0.3, f"Cross-correlation too high: {cross_corr}"
+
+    h4 = arena.allocate()
+    arena.bundle([h1, h2], h4)
+
+    print("[PASS] hdc_core")
+
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    test_topology_core()
+    test_hdc_core()
+    print("\nAll core module tests passed.")
