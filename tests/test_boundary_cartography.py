@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 hdc_core = pytest.importorskip("hdc_core")
 
 from src.synthesis.wall_archive import WallArchive, WallRecord
-from src.decoder.constraint_decoder import UnsatCoreResult
+from src.decoder.constraint_decoder import ConstraintDecoder, UnsatCoreResult
 from src.projection.isomorphic_projector import IsomorphicProjector
 from src.analysis.boundary_cartography import (
     estimate_residual_dimension,
@@ -196,7 +196,64 @@ class TestMultiQuotientProjection:
             f"Wall 2 not projected out: before={corr_before_2:.4f}, after={corr_after_2:.4f}"
 
 
-# ── Test 4: Residual dimension estimation ────────────────────────
+# ── Test 4: Arena integrity — analysis must not corrupt main arena ─
+
+class TestArenaIntegrity:
+    def test_estimate_does_not_corrupt_arena(self, arena_dim):
+        """Calling estimate_residual_dimension must not change
+        existing vectors in the main arena."""
+        arena, dim = arena_dim
+        # Create a corpus vector
+        phases = _deterministic_phases(42, dim)
+        corpus_h = arena.allocate()
+        arena.inject_phases(corpus_h, phases)
+        # Record self-correlation before
+        corr_before = arena.compute_correlation(corpus_h, corpus_h)
+        # Create walls and run estimation
+        wall_handles = []
+        for i in range(3):
+            wp = _deterministic_phases(300 + i, dim)
+            wh = arena.allocate()
+            arena.inject_phases(wh, wp)
+            wall_handles.append(wh)
+        estimate_residual_dimension(arena, wall_handles, dim)
+        # Self-correlation must be unchanged
+        corr_after = arena.compute_correlation(corpus_h, corpus_h)
+        assert abs(corr_after - corr_before) < 0.01, \
+            f"Arena corrupted: self-corr {corr_before:.4f} → {corr_after:.4f}"
+
+    def test_extract_open_dirs_does_not_corrupt_arena(self, arena_dim):
+        """Calling extract_open_directions must not change
+        existing vectors in the main arena."""
+        arena, dim = arena_dim
+        # Create a corpus vector
+        phases = _deterministic_phases(55, dim)
+        corpus_h = arena.allocate()
+        arena.inject_phases(corpus_h, phases)
+
+        # Create a second vector to measure pairwise correlation stability
+        phases2 = _deterministic_phases(56, dim)
+        corpus_h2 = arena.allocate()
+        arena.inject_phases(corpus_h2, phases2)
+
+        corr_before = arena.compute_correlation(corpus_h, corpus_h2)
+
+        # Record walls in archive
+        archive = WallArchive(arena, dim)
+        for i in range(3):
+            core = _make_unsat_core(arena, dim, seed=310 + i)
+            archive.record(core, synthesis_context=f"integrity_{i}")
+
+        projector = IsomorphicProjector(arena, dim)
+        extract_open_directions(arena, projector, archive, n_directions=3)
+
+        # Pairwise correlation must be unchanged
+        corr_after = arena.compute_correlation(corpus_h, corpus_h2)
+        assert abs(corr_after - corr_before) < 0.01, \
+            f"Arena corrupted: pairwise corr {corr_before:.4f} → {corr_after:.4f}"
+
+
+# ── Test 5: Residual dimension estimation ─────────────────────────
 
 class TestResidualDimension:
     def test_zero_walls_full_dimension(self, arena_dim):
@@ -227,7 +284,7 @@ class TestResidualDimension:
         assert result["estimated_residual_dimension"] <= dim
 
 
-# ── Test 5: Open direction extraction ────────────────────────────
+# ── Test 6: Open direction extraction ─────────────────────────────
 
 class TestOpenDirections:
     def test_one_wall_has_open_directions(self, arena_dim):
@@ -252,7 +309,7 @@ class TestOpenDirections:
             assert corr < 0.5, f"Open direction too correlated with wall: {corr:.4f}"
 
 
-# ── Test 6: Directed synthesis smoke test ────────────────────────
+# ── Test 7: Directed synthesis smoke test ─────────────────────────
 
 class TestDirectedSynthesis:
     def test_smoke_ingest_and_synthesize(self, arena_dim):
@@ -303,7 +360,7 @@ class TestDirectedSynthesis:
             assert result is None or isinstance(result, str)
 
 
-# ── Test 7: Revalidation after dimension expansion ───────────────
+# ── Test 8: Revalidation after dimension expansion ────────────────
 
 class TestRevalidateAfterDimensionExpansion:
     def test_revalidate_after_expand(self, arena_dim):
@@ -335,7 +392,7 @@ class TestRevalidateAfterDimensionExpansion:
         assert result["still_valid"] + result["resolved"] + result["orphaned"] == 1
 
 
-# ── Test 8: Resolved walls excluded from active map ──────────────
+# ── Test 9: Resolved walls excluded from active map ───────────────
 
 class TestResolvedWallsExcluded:
     def test_resolved_excluded_from_handles(self, arena_dim):
@@ -366,7 +423,7 @@ class TestResolvedWallsExcluded:
         assert (0, 0) not in resonance or len(resonance) <= 1
 
 
-# ── Test 9: Serialization round-trip ─────────────────────────────
+# ── Test 10: Serialization round-trip ─────────────────────────────
 
 class TestSerialization:
     def test_serialize_deserialize(self, arena_dim, tmp_path):
