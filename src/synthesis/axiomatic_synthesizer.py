@@ -88,15 +88,46 @@ class ResonanceMatrix:
     def compute_full(self) -> Dict[Tuple[str, str], float]:
         self._matrix.clear()
         ids = self.store.all_ids()
-        for i, id_a in enumerate(ids):
-            ax_a = self.store.axioms[id_a]
-            for id_b in ids[i:]:
-                ax_b = self.store.axioms[id_b]
-                corr = self.arena.compute_correlation(ax_a.handle, ax_b.handle)
-                self._matrix[(id_a, id_b)] = corr
-                self._matrix[(id_b, id_a)] = corr
-                ax_a.resonance_profile[id_b] = corr
-                ax_b.resonance_profile[id_a] = corr
+        n = len(ids)
+        if n == 0:
+            return self._matrix
+
+        # Batch: single Rust FFI call for entire upper triangle
+        handles = [self.store.axioms[sid].handle for sid in ids]
+        has_batch = hasattr(self.arena, 'correlate_matrix')
+
+        if has_batch and n >= 2:
+            flat = self.arena.correlate_matrix(handles)
+            # Unpack flat upper-triangle into symmetric dict
+            k = 0
+            for i in range(n):
+                id_a = ids[i]
+                ax_a = self.store.axioms[id_a]
+                # Self-correlation
+                self._matrix[(id_a, id_a)] = self.arena.compute_correlation(
+                    handles[i], handles[i])
+                ax_a.resonance_profile[id_a] = self._matrix[(id_a, id_a)]
+                for j in range(i + 1, n):
+                    id_b = ids[j]
+                    ax_b = self.store.axioms[id_b]
+                    corr = flat[k]
+                    k += 1
+                    self._matrix[(id_a, id_b)] = corr
+                    self._matrix[(id_b, id_a)] = corr
+                    ax_a.resonance_profile[id_b] = corr
+                    ax_b.resonance_profile[id_a] = corr
+        else:
+            # Fallback: individual calls (N < 2 or no batch support)
+            for i, id_a in enumerate(ids):
+                ax_a = self.store.axioms[id_a]
+                for id_b in ids[i:]:
+                    ax_b = self.store.axioms[id_b]
+                    corr = self.arena.compute_correlation(ax_a.handle, ax_b.handle)
+                    self._matrix[(id_a, id_b)] = corr
+                    self._matrix[(id_b, id_a)] = corr
+                    ax_a.resonance_profile[id_b] = corr
+                    ax_b.resonance_profile[id_a] = corr
+
         return self._matrix
 
     def get(self, id_a: str, id_b: str) -> float:
