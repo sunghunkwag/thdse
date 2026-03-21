@@ -214,6 +214,11 @@ class ThdseAgent:
                 phases = list(self.arena.extract_phases(synth_proj.final_handle))
                 self._timestamp += 1
 
+                # Extract per-layer phases for layered consensus
+                ast_ph = synth_proj.ast_phases if synth_proj.ast_phases else None
+                cfg_ph = synth_proj.cfg_phases if synth_proj.cfg_phases is not None else None
+                data_ph = synth_proj.data_phases if synth_proj.data_phases is not None else None
+
                 candidates.append(PhaseMessage(
                     sender_id=self.agent_id,
                     message_type="candidate",
@@ -225,6 +230,9 @@ class ThdseAgent:
                         "clique_size": len(clique),
                     },
                     timestamp=self._timestamp,
+                    ast_phases=ast_ph,
+                    cfg_phases=cfg_ph,
+                    data_phases=data_ph,
                 ))
 
         return candidates

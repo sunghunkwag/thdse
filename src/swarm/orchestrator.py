@@ -1,18 +1,18 @@
 """SwarmOrchestrator — Central coordinator for the THDSE-Swarm.
 
 Manages agent lifecycle, collects candidates, computes algebraic consensus
-via correlate_matrix + Bron-Kerbosch, handles UNSAT broadcasting (Global
-Quotient Collapse), and tracks swarm-level metrics.
+via correlate_matrix + Bron-Kerbosch, handles UNSAT broadcasting (Localized
+Quotient Isolation), and tracks swarm-level metrics.
 
 Each round:
   1. Each agent runs local synthesis -> emits candidate PhaseMessages
   2. Orchestrator collects all candidates
-  3. Compute consensus via correlate_matrix + Bron-Kerbosch
+  3. Compute consensus via correlate_matrix + Bron-Kerbosch (layered partial match)
   4. Decode consensus centroid -> Z3 -> Python AST
   5. If SAT: execute in sandbox -> evaluate fitness
      - If fitness > threshold: broadcast consensus to all agents
-  6. If UNSAT: extract V_error -> broadcast to ALL agents
-     - Every agent immediately projects out V_error from its arena
+  6. If UNSAT: extract actual V_error -> broadcast ONLY to participating agents
+     - Non-participating agents' design spaces remain intact
   7. Track metrics
   8. Halt when: max_rounds reached OR stagnation_limit consecutive
      rounds with zero progress
@@ -49,6 +49,7 @@ class SwarmRoundResult:
     fitness: float
     walls_broadcast: int
     vocab_growth_per_agent: List[int]
+    wall_target_agents: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -184,6 +185,7 @@ class SwarmOrchestrator:
             decoded_source = None
             fitness = 0.0
             walls_this_round = 0
+            wall_target_agents: List[int] = []
 
             if len(all_candidates) >= 2:
                 # Create temporary arena for consensus
@@ -194,12 +196,25 @@ class SwarmOrchestrator:
                 candidate_phases = [msg.phases for msg in all_candidates]
                 candidate_metadata = [msg.metadata for msg in all_candidates]
 
+                # Collect per-layer phases for layered consensus
+                ast_phases_list = [msg.ast_phases for msg in all_candidates]
+                cfg_phases_list = [msg.cfg_phases for msg in all_candidates]
+                data_phases_list = [msg.data_phases for msg in all_candidates]
+
+                # Only pass layer phases if at least one candidate has them
+                has_ast = any(p is not None for p in ast_phases_list)
+                has_cfg = any(p is not None for p in cfg_phases_list)
+                has_data = any(p is not None for p in data_phases_list)
+
                 consensus = compute_swarm_consensus(
                     tmp_arena,
                     candidate_phases,
                     candidate_metadata,
                     consensus_threshold=self.config.consensus_threshold,
                     min_clique_size=2,
+                    candidate_ast_phases=ast_phases_list if has_ast else None,
+                    candidate_cfg_phases=cfg_phases_list if has_cfg else None,
+                    candidate_data_phases=data_phases_list if has_data else None,
                 )
 
                 if consensus is not None:
@@ -209,7 +224,7 @@ class SwarmOrchestrator:
                     total_consensus += 1
 
                     # Step 3: Decode consensus centroid
-                    decoded_source, is_unsat = self._decode_consensus(
+                    decoded_source, v_error_phases = self._decode_consensus(
                         consensus.centroid_phases,
                     )
 
@@ -226,9 +241,16 @@ class SwarmOrchestrator:
                         if fitness >= self.config.fitness_threshold:
                             self._broadcast_consensus(consensus.centroid_phases)
                     else:
-                        # UNSAT: broadcast wall to all agents
-                        # Use the consensus centroid as V_error
-                        self._broadcast_wall(consensus.centroid_phases)
+                        # UNSAT: broadcast wall ONLY to participating agents
+                        actual_v_error = (
+                            v_error_phases
+                            if v_error_phases is not None
+                            else consensus.centroid_phases
+                        )
+                        wall_target_agents = consensus.clique_agent_ids
+                        self._broadcast_wall_targeted(
+                            actual_v_error, wall_target_agents,
+                        )
                         walls_this_round += 1
                         total_walls += 1
 
@@ -250,6 +272,7 @@ class SwarmOrchestrator:
                 fitness=fitness,
                 walls_broadcast=walls_this_round,
                 vocab_growth_per_agent=vocab_growth,
+                wall_target_agents=wall_target_agents,
             )
             round_history.append(round_result)
 
@@ -330,15 +353,33 @@ class SwarmOrchestrator:
             all_candidates.extend(candidates)
         return all_candidates
 
-    def _broadcast_wall(self, wall_phases: List[float]) -> None:
-        """Broadcast V_error to all agents.
+    def _broadcast_wall_targeted(
+        self, wall_phases: List[float], target_agent_ids: List[int],
+    ) -> None:
+        """Broadcast V_error ONLY to agents that participated in the consensus.
 
-        Each agent calls receive_wall_broadcast(wall_phases),
-        which triggers immediate quotient space projection
-        in that agent's local arena.
+        Agents not in target_agent_ids are not affected. Their design space
+        remains intact. This prevents autoimmune collapse where a local
+        contradiction destroys globally valid structures.
+
+        Args:
+            wall_phases: Phase array of the contradiction vector.
+            target_agent_ids: Agent IDs from ConsensusResult.clique_agent_ids.
         """
+        targeted = set(target_agent_ids)
         for agent in self.agents:
-            agent.receive_wall_broadcast(wall_phases)
+            if agent.agent_id in targeted:
+                agent.receive_wall_broadcast(wall_phases)
+
+    def _broadcast_wall(self, wall_phases: List[float]) -> None:
+        """Broadcast V_error to all agents (deprecated).
+
+        Use _broadcast_wall_targeted() instead for localized quotient isolation.
+        Kept for backward compatibility.
+        """
+        self._broadcast_wall_targeted(
+            wall_phases, [agent.agent_id for agent in self.agents],
+        )
 
     def _broadcast_consensus(self, consensus_phases: List[float]) -> None:
         """Broadcast successful consensus to all agents.
@@ -351,16 +392,18 @@ class SwarmOrchestrator:
 
     def _decode_consensus(
         self, consensus_phases: List[float],
-    ) -> Tuple[Optional[str], bool]:
+    ) -> Tuple[Optional[str], Optional[List[float]]]:
         """Decode the consensus centroid to Python source.
 
         Uses the orchestrator's own decoder (not any agent's).
 
         Returns:
-            (decoded_source_or_None, is_unsat)
+            (decoded_source_or_None, v_error_phases_or_None)
+            On SAT success: (source_string, None)
+            On UNSAT: (None, v_error_phase_array)
         """
         if self._consensus_decoder is None:
-            return None, True
+            return None, None
 
         # Inject consensus into orchestrator's arena
         consensus_h = self._consensus_arena.allocate()
@@ -379,8 +422,20 @@ class SwarmOrchestrator:
 
         source = self._consensus_decoder.decode_to_source(lp)
         if source and source.strip() and source.strip() != "pass":
-            return source, False
-        return None, True
+            return source, None
+
+        # UNSAT: try to extract actual V_error from meta-grammar log
+        meta_log = self._consensus_decoder.get_meta_grammar_log()
+        for event in reversed(meta_log):
+            if (event.unsat_core is not None
+                    and event.unsat_core.v_error_handle is not None):
+                v_error_phases = list(self._consensus_arena.extract_phases(
+                    event.unsat_core.v_error_handle,
+                ))
+                return None, v_error_phases
+
+        # Fallback: no UNSAT core available
+        return None, None
 
     def ingest_agent_corpora_dicts(
         self, corpora: List[Dict[str, str]],

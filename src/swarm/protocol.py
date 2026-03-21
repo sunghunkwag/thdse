@@ -9,7 +9,7 @@ exact precision preservation.
 import json
 import struct
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -17,9 +17,13 @@ class PhaseMessage:
     """A single message in the VSA2VSA protocol."""
     sender_id: int                    # Agent index
     message_type: str                 # "candidate" | "wall" | "target" | "ack"
-    phases: List[float]               # The phase array (d floats)
+    phases: List[float]               # The phase array (d floats) — final_handle phases
     metadata: Dict[str, Any]          # fitness, entropy, source_context, etc.
     timestamp: int                    # Monotonic counter (not wall clock)
+    # Per-layer phase arrays for layered consensus
+    ast_phases: Optional[List[float]] = None
+    cfg_phases: Optional[List[float]] = None
+    data_phases: Optional[List[float]] = None
 
 
 @dataclass
@@ -41,15 +45,18 @@ class SwarmConfig:
 # ── Serialization ────────────────────────────────────────────────
 
 # Wire format:
-#   [4 bytes: header_len (uint32 big-endian)]
-#   [header_len bytes: JSON header (UTF-8)]
-#   [remaining bytes: float32 array via struct.pack]
+#   [4B header_len][header JSON]
+#   [4B ast_len][ast float32s]
+#   [4B cfg_len][cfg float32s]
+#   [4B data_len][data float32s]
+#   [remaining: final float32s]
 
 def serialize_message(msg: PhaseMessage) -> bytes:
     """Serialize a PhaseMessage to bytes for IPC.
 
     Format: JSON header (message_type, sender_id, metadata, timestamp)
-    followed by raw float32 array for phases.
+    followed by per-layer float32 arrays (with 4-byte length prefixes)
+    and the final phases array.
 
     The phases are raw floats packed via struct, not encoded as strings.
     The JSON header is minimal metadata only.
@@ -62,9 +69,26 @@ def serialize_message(msg: PhaseMessage) -> bytes:
     }, separators=(",", ":")).encode("utf-8")
 
     header_len = len(header)
-    # Pack: 4-byte header length + header + float32 array
+
+    # Pack per-layer arrays with length prefixes
+    def pack_optional_phases(phases: Optional[List[float]]) -> bytes:
+        if phases is None or len(phases) == 0:
+            return struct.pack(">I", 0)
+        packed = struct.pack(f">{len(phases)}f", *phases)
+        return struct.pack(">I", len(packed)) + packed
+
+    ast_packed = pack_optional_phases(msg.ast_phases)
+    cfg_packed = pack_optional_phases(msg.cfg_phases)
+    data_packed = pack_optional_phases(msg.data_phases)
+
+    # Final phases (no length prefix — they consume the remaining bytes)
     phases_packed = struct.pack(f">{len(msg.phases)}f", *msg.phases)
-    return struct.pack(">I", header_len) + header + phases_packed
+
+    return (
+        struct.pack(">I", header_len) + header
+        + ast_packed + cfg_packed + data_packed
+        + phases_packed
+    )
 
 
 def deserialize_message(data: bytes) -> PhaseMessage:
@@ -72,14 +96,36 @@ def deserialize_message(data: bytes) -> PhaseMessage:
     if len(data) < 4:
         raise ValueError("Message too short: missing header length")
 
-    header_len = struct.unpack(">I", data[:4])[0]
-    if len(data) < 4 + header_len:
+    offset = 0
+
+    # Read header
+    header_len = struct.unpack(">I", data[offset:offset + 4])[0]
+    offset += 4
+    if len(data) < offset + header_len:
         raise ValueError("Message truncated: header incomplete")
-
-    header_bytes = data[4:4 + header_len]
+    header_bytes = data[offset:offset + header_len]
     header = json.loads(header_bytes.decode("utf-8"))
+    offset += header_len
 
-    phases_bytes = data[4 + header_len:]
+    # Read per-layer arrays
+    def read_optional_phases(off: int):
+        if off + 4 > len(data):
+            return None, off
+        layer_len = struct.unpack(">I", data[off:off + 4])[0]
+        off += 4
+        if layer_len == 0:
+            return None, off
+        n_floats = layer_len // 4
+        phases = list(struct.unpack(f">{n_floats}f", data[off:off + layer_len]))
+        off += layer_len
+        return phases, off
+
+    ast_phases, offset = read_optional_phases(offset)
+    cfg_phases, offset = read_optional_phases(offset)
+    data_phases, offset = read_optional_phases(offset)
+
+    # Read final phases (remaining bytes)
+    phases_bytes = data[offset:]
     n_floats = len(phases_bytes) // 4
     if n_floats > 0:
         phases = list(struct.unpack(f">{n_floats}f", phases_bytes))
@@ -92,4 +138,7 @@ def deserialize_message(data: bytes) -> PhaseMessage:
         phases=phases,
         metadata=header.get("metadata", {}),
         timestamp=header["timestamp"],
+        ast_phases=ast_phases,
+        cfg_phases=cfg_phases,
+        data_phases=data_phases,
     )
