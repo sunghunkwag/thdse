@@ -41,6 +41,17 @@ A strictly deterministic architecture that mathematically synthesizes new code s
                          │    d → 2d (conjugate reflection)  │
                          └──────────────────────────────────┘
 
+                         ┌──────────────────────────────────┐
+                         │   BOUNDARY CARTOGRAPHY            │
+                         │                                   │
+                         │ 1. Collect V_error walls           │
+                         │ 2. Map wall resonance → cliques   │
+                         │ 3. Estimate residual dimension    │
+                         │ 4. Extract open directions        │
+                         │ 5. Synthesize along open dirs     │
+                         │ 6. Iterate until space closes     │
+                         └──────────────────────────────────┘
+
                          ┌──────────────────┐
                          │   DISCOVERY       │
                          │   Corpus Ingest → │
@@ -162,7 +173,57 @@ $$
 
 **Phase 3 — Dimension Expansion**: expand the representational capacity d → 2d via deterministic conjugate reflection, then rebuild the vocabulary and re-probe at the higher dimension.
 
-### 6. Structural Diff Engine (`src/analysis/structural_diff.py`)
+### 6. Boundary Cartography (`src/analysis/boundary_cartography.py`)
+
+The synthesis pipeline produces novel code structures by composing axiom vectors via algebraic operations. However, not all regions of the hypervector space yield satisfiable constraint systems — the Z3 solver may return UNSAT, indicating a topological contradiction. Each such event produces a Contradiction Vector V_error that encodes the precise axis of failure. The Boundary Cartography subsystem systematically collects, analyses, and exploits these contradiction signals to map the geometry of the design space boundary.
+
+#### Wall Archive (`src/synthesis/wall_archive.py`)
+
+The Wall Archive provides persistent storage for Contradiction Vectors accumulated across synthesis attempts. Each `WallRecord` captures:
+
+- The arena handle and phase array of V_error (the latter enabling re-injection after arena reset)
+- The UNSAT core labels and corresponding atom handles from Z3's minimal conflict extraction
+- Provenance metadata (synthesis context, temporal index, status)
+
+Walls are never deleted; they transition between three statuses: **active** (confirmed UNSAT boundary), **resolved** (previously UNSAT, now SAT after a design space modification such as dimension expansion or vocabulary update), and **orphaned** (constituent atoms no longer present in the current vocabulary). Revalidation is triggered deterministically by design space changes and proceeds by re-encoding the original UNSAT core constraints and re-solving via Z3.
+
+The archive supports Bron-Kerbosch clique extraction over the wall resonance matrix, identifying **boundary regions** — clusters of structurally similar contradictions that delineate coherent forbidden zones in the design space.
+
+Serialization and deserialization via pickle enable persistence of the boundary map across sessions, with automatic re-injection of phase arrays into a fresh arena upon loading.
+
+#### Residual Dimension Estimation
+
+After accumulating k wall vectors, the cartography module estimates the effective dimension of the residual subspace H/⟨V₁, …, Vₖ⟩ — the portion of the original d-dimensional space that remains accessible for synthesis. The procedure is as follows:
+
+1. **Deterministic probe generation**: N = min(2d, 50) probe vectors are generated via a hash-seeded linear congruential generator, ensuring full reproducibility
+2. **Multi-quotient projection**: all probes are projected through the quotient space spanned by the wall vectors, removing the forbidden subspace
+3. **Correlation matrix construction**: the N × N pairwise correlation matrix of the projected probes is computed
+4. **Spectral analysis**: approximate singular values are derived via Gershgorin disc estimates on the correlation matrix; the effective dimension d_eff equals the count of singular values exceeding a noise threshold (ε = 0.01)
+
+The compression ratio d_eff / d quantifies how much of the design space has been consumed by contradictions. When d_eff < 0.1 · d, the space is classified as **closed** — further synthesis is unlikely to produce novel satisfiable structures.
+
+#### Open Direction Extraction
+
+The cartography module identifies the top-k directions of maximum variance in the residual space — the unexplored regions where new synthesis has the highest probability of producing novel, non-contradictory results. For each direction, the procedure selects the corpus axioms most aligned with that direction (by correlation) and synthesizes from this direction-biased subset rather than from standard resonance cliques.
+
+#### Multi-Quotient Projection (`src/hdc_core/src/lib.rs`)
+
+The HDC core is extended with `project_to_multi_quotient_space`, which removes an entire subspace spanned by multiple wall vectors simultaneously. Unlike sequential single-vector projection (which introduces order-dependent numerical drift), this operation first orthogonalizes the wall vectors via Gram-Schmidt with complex inner products, then projects each orthogonalized basis vector out sequentially. The resulting projection is mathematically equivalent to simultaneous subspace removal, with complexity O(k² · d + k · head · d) where k denotes the number of walls.
+
+#### Cartography Loop
+
+The `run_boundary_cartography` function executes the complete iterative loop:
+
+1. **Map**: compute wall resonance matrix and extract boundary region cliques
+2. **Measure**: estimate the residual subspace dimension
+3. **Navigate**: extract principal open directions from the residual space
+4. **Synthesize**: attempt directed synthesis along each open direction
+5. **Record**: if UNSAT, record the new wall and re-map; if SAT, record the successful synthesis
+6. **Terminate**: halt when no open directions remain, the space is classified as closed, or the maximum iteration count is reached
+
+The output is a structured `boundary_map.json` containing the wall archive summary, boundary region cliques, residual dimension trajectory, and all successful directed syntheses.
+
+### 8. Structural Diff Engine (`src/analysis/structural_diff.py`)
 
 The standard resonance metric collapses the three topology layers (AST, CFG, data-dependency) into a single scalar similarity ρ ∈ ℝ. While sufficient for clustering and clique extraction, this conflation discards diagnostically valuable information about which structural dimension drives the observed similarity or divergence.
 
@@ -196,7 +257,7 @@ Given two versions of the same source file, the temporal analysis module project
 
 This provides semantic classification of code evolution that textual diff cannot capture: git observes character-level deltas, whereas THDSE observes topological transformations.
 
-### 7. Corpus Ingestion (`src/corpus/`)
+### 9. Corpus Ingestion (`src/corpus/`)
 **Batch Ingester**: scalable pipeline for processing directories of Python projects into VSA space.
 - Walks project trees with configurable filtering (skip tests, `__init__.py`, generated code, files exceeding 64 KB)
 - Graceful error handling: syntax errors, projection failures, and arena capacity exhaustion are logged and skipped without crashing
@@ -205,7 +266,7 @@ This provides semantic classification of code evolution that textual diff cannot
 
 **Stdlib Corpus**: auto-discovers the current Python installation's standard library as a guaranteed-available corpus requiring no external downloads.
 
-### 8. Resonance Analysis (`src/analysis/`)
+### 10. Resonance Analysis (`src/analysis/`)
 **Resonance Analyzer**: computes the full pairwise resonance matrix and extracts structural patterns invisible to manual code review.
 
 - **Hierarchical clustering**: agglomerative Ward-linkage clustering on the resonance-derived distance matrix (1 − ρ), yielding dendrograms that reveal which files are structurally isomorphic despite differing in purpose
@@ -224,7 +285,7 @@ This provides semantic classification of code evolution that textual diff cannot
 - Temporal change classification for version-to-version comparisons
 - Linkage matrix for external dendrogram visualization
 
-### 9. CLI Entry Point (`src/discover.py`)
+### 11. CLI Entry Point (`src/discover.py`)
 Multi-mode orchestration of the full pipeline, selectable via `--mode`:
 
 ```bash
@@ -242,6 +303,9 @@ python src/discover.py --mode synthesis --corpus ./projects/ --output ./report/
 
 # Ouroboros self-diagnostic: the engine analyzes its own source
 python src/discover.py --mode self-diagnostic --output ./report/
+
+# Boundary cartography: map design space walls and navigate open directions
+python src/discover.py --mode cartography --corpus ./projects/ --output ./report/
 
 # Analyze one or more project directories
 python src/discover.py --corpus ./project_a/ ./project_b/ --output ./report/
@@ -269,7 +333,8 @@ thdse/
 │   ├── projection/            # Graph → VSA isomorphic mapping
 │   │   └── isomorphic_projector.py
 │   ├── synthesis/             # Axiomatic phase-transition engine
-│   │   └── axiomatic_synthesizer.py
+│   │   ├── axiomatic_synthesizer.py
+│   │   └── wall_archive.py        # Contradiction vector persistence
 │   ├── decoder/               # SMT-based constraint decoder
 │   │   ├── constraint_decoder.py
 │   │   ├── subtree_vocab.py   # Corpus-derived sub-tree vocabulary
@@ -282,13 +347,15 @@ thdse/
 │   │   ├── report.py
 │   │   ├── structural_diff.py     # Layer-decomposed similarity
 │   │   ├── refactoring_detector.py # Duplicate & unification detection
-│   │   └── temporal_diff.py       # Version-to-version change classification
+│   │   ├── temporal_diff.py       # Version-to-version change classification
+│   │   └── boundary_cartography.py # Design space boundary mapping
 │   ├── utils/                 # Phase algebra utilities
 │   │   └── arena_ops.py
 │   └── discover.py            # CLI entry point (multi-mode)
 ├── tests/
 │   ├── test_decoder_subtree.py    # Sub-tree vocabulary & threading tests
-│   └── test_structural_diff.py    # Structural diff engine tests
+│   ├── test_structural_diff.py    # Structural diff engine tests
+│   └── test_boundary_cartography.py # Boundary cartography & wall archive tests
 ├── run_tests.py
 ├── requirements.txt
 └── Cargo.toml
@@ -309,7 +376,7 @@ cd src/hdc_core && maturin develop --release && cd ../..
 # Install Python dependencies
 pip install -r requirements.txt
 
-# Run full test suite (14 tests including sub-tree decoding and structural diff)
+# Run full test suite (including sub-tree decoding, structural diff, and boundary cartography)
 python run_tests.py
 
 # Run the empirical discovery pipeline against stdlib
@@ -346,8 +413,24 @@ Notable findings:
 - **Meta-grammar emergence**: on UNSAT, the decoder deterministically synthesizes new algebraic operators (fusion) or expands the representational dimension (d → 2d via conjugate reflection) to resolve contradictions.
 - **Quotient space correctness**: the orthogonal projection X' = X − V·(V^H·X)/(V^H·V) annihilates exactly the one-dimensional subspace spanned by V_error. The resulting quotient space H/⟨V_error⟩ preserves all pairwise correlations that are orthogonal to the contradiction axis, ensuring that structurally valid relationships remain undistorted after folding. Post-projection re-normalization to unit magnitude per component maintains the FHRR representational invariant.
 - **Sub-tree compositionality**: the sub-tree vocabulary preserves the algebraic guarantees of the atom vocabulary while operating over concrete AST fragments. Canonicalization is deterministic (pre-order traversal with positional placeholder assignment), deduplication is collision-resistant (SHA-256), and variable threading is near-linear (union-find with path compression and union by rank). The assembled output is verified via `compile()` to ensure syntactic validity.
+- **Multi-quotient correctness**: the multi-vector quotient projection H/⟨V₁, …, Vₖ⟩ first orthogonalizes the wall vectors via Gram-Schmidt with complex inner products, then applies sequential single-vector projection. The Gram-Schmidt step ensures that sequential projection is mathematically equivalent to simultaneous subspace removal, eliminating order-dependent numerical drift inherent in naïve sequential application. Linearly dependent wall vectors are detected (‖Vᵢ‖² < ε) and excluded, preventing rank-deficient projections.
+- **Boundary convergence**: the cartography loop is monotonically non-expansive — each iteration either discovers a new wall (reducing the residual dimension) or produces a successful synthesis (demonstrating reachability), guaranteeing termination within max(d, max_iterations) steps. The residual dimension estimate provides a quantitative convergence certificate: when d_eff < 0.1 · d, the design space is classified as closed.
 
 ## Changelog
+
+### v0.4.0 — Boundary Cartography
+
+This release introduces the Boundary Cartography subsystem, which extends the engine's synthesis capabilities from open-loop clique-based generation to closed-loop, boundary-aware design space exploration.
+
+**Wall Archive.** A persistent store for Contradiction Vectors (V_error) produced by the constraint decoder upon UNSAT events. Each wall record captures the arena handle, phase array (enabling cross-session persistence), UNSAT core labels, and provenance metadata. Walls are classified as active, resolved, or orphaned; revalidation is triggered deterministically upon design space modifications (dimension expansion, vocabulary update) via Z3 re-solve. Bron-Kerbosch clique extraction over the wall resonance matrix identifies coherent boundary regions — clusters of structurally similar contradictions.
+
+**Residual Dimension Estimation.** A spectral analysis module that quantifies the accessible fraction of the design space after projecting out all known walls. Deterministic hash-seeded probe vectors are projected through the multi-quotient space, and approximate singular values of the resulting correlation matrix are computed via Gershgorin disc bounds. The effective dimension d_eff serves as a convergence certificate: when d_eff < 0.1 · d, the space is classified as closed.
+
+**Open Direction Extraction.** Principal component analysis over the residual space identifies the top-k directions of maximum variance — the unexplored regions where synthesis is most likely to produce novel, non-contradictory structures. Directed synthesis selects corpus axioms by correlation with these open directions rather than by standard resonance cliques, biasing generation away from known boundary walls.
+
+**Multi-Quotient Projection (Rust/AVX2).** The HDC core is extended with `project_to_multi_quotient_space`, which removes an entire k-dimensional subspace simultaneously via Gram-Schmidt orthogonalization with complex inner products followed by sequential single-vector projection. This eliminates order-dependent numerical drift inherent in naïve sequential application, with complexity O(k² · d + k · head · d).
+
+**Cartography CLI Mode.** A new `--mode cartography` integrates the full iterative loop — wall collection, boundary mapping, residual estimation, open direction extraction, directed synthesis, and convergence detection — into the CLI entry point, with structured output to `boundary_map.json`.
 
 ### v0.3.0 — Architectural Upgrade (4-Leap Expansion)
 
