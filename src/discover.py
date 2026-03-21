@@ -389,6 +389,97 @@ def _run_self_diagnostic(args, arena, projector, synthesizer, verbose):
         print(f"  synthesis_quality.json: {quality_path}")
 
 
+def _run_cartography(args, arena, projector, synthesizer, verbose):
+    """Run boundary cartography: map design space walls and find open directions."""
+    from src.decoder.constraint_decoder import ConstraintDecoder
+    from src.decoder.subtree_vocab import SubTreeVocabulary
+    from src.synthesis.wall_archive import WallArchive
+    from src.analysis.boundary_cartography import run_boundary_cartography
+
+    total_axioms = synthesizer.store.count()
+    if total_axioms < 2:
+        print("ERROR: Need at least 2 axioms for cartography.")
+        sys.exit(1)
+
+    # Build sub-tree vocabulary from corpus
+    vocab = SubTreeVocabulary()
+    if args.corpus:
+        for corpus_dir in args.corpus:
+            for root, _dirs, files in os.walk(corpus_dir):
+                for fname in files:
+                    if fname.endswith(".py"):
+                        vocab.ingest_file(os.path.join(root, fname))
+    projected = vocab.project_all(arena, projector)
+
+    if verbose:
+        summary = vocab.summary()
+        print(f"  Sub-tree vocabulary: {summary['unique_subtrees']} patterns, {projected} projected")
+
+    # Create wall archive
+    wall_archive = WallArchive(arena, args.dimension)
+
+    # Create decoder with wall archive
+    decoder = ConstraintDecoder(
+        arena, projector, args.dimension,
+        activation_threshold=0.04,
+        subtree_vocab=vocab,
+        wall_archive=wall_archive,
+    )
+
+    if verbose:
+        print("Running standard synthesis (collecting walls)...")
+
+    # Run standard synthesis first to collect walls
+    synthesizer.compute_resonance()
+    cliques = synthesizer.extract_cliques(min_size=2)
+    for clique in cliques[:5]:
+        synth_proj = synthesizer.synthesize_from_clique(clique)
+        decoder.decode_to_source(synth_proj)
+
+    if verbose:
+        print(f"  Walls collected: {wall_archive.count()}")
+        print("Running boundary cartography loop...")
+
+    # Run boundary cartography
+    result = run_boundary_cartography(
+        arena, projector, synthesizer, decoder,
+        wall_archive, max_iterations=10,
+    )
+
+    if verbose:
+        print(f"\n  Iterations: {result['iterations']}")
+        print(f"  Walls discovered: {result['walls_discovered']}")
+        print(f"  Successful syntheses: {len(result['successful_syntheses'])}")
+        print(f"  Space closed: {result['is_space_closed']}")
+        print(f"  Open directions remaining: {result['open_directions_remaining']}")
+
+    # Output boundary_map.json
+    os.makedirs(args.output, exist_ok=True)
+    boundary_map = {
+        "wall_archive_summary": {
+            "total_walls": wall_archive.count(),
+            "wall_contexts": [w.synthesis_context for w in wall_archive.get_walls()],
+        },
+        "wall_clique_analysis": {
+            "clique_count": len(result["wall_cliques"]),
+            "cliques": result["wall_cliques"],
+        },
+        "residual_dimension_estimate": result["residual_dimension_history"],
+        "open_direction_count": result["open_directions_remaining"],
+        "successful_directed_syntheses": [
+            {"iteration": s["iteration"], "variance": s["variance"],
+             "source_preview": s["source"][:200] if s["source"] else None}
+            for s in result["successful_syntheses"]
+        ],
+        "is_space_closed": result["is_space_closed"],
+    }
+    json_path = os.path.join(args.output, "boundary_map.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(boundary_map, f, indent=2)
+    if verbose:
+        print(f"\n  JSON: {json_path}")
+
+
 def main() -> None:
     """Run the structural discovery pipeline."""
     parser = argparse.ArgumentParser(
@@ -397,9 +488,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["analysis", "diff", "refactor", "synthesis", "self-diagnostic"],
+        choices=["analysis", "diff", "refactor", "synthesis", "self-diagnostic", "cartography"],
         default="analysis",
-        help="Pipeline mode: analysis (default), diff, refactor, synthesis, self-diagnostic.",
+        help="Pipeline mode: analysis (default), diff, refactor, synthesis, self-diagnostic, cartography.",
     )
     parser.add_argument(
         "--corpus",
@@ -470,7 +561,7 @@ def main() -> None:
             parser.error("--mode diff requires exactly 2 file paths as positional arguments")
     elif mode == "self-diagnostic":
         pass  # No corpus required
-    elif mode in ("analysis", "refactor", "synthesis"):
+    elif mode in ("analysis", "refactor", "synthesis", "cartography"):
         if not args.corpus and not args.stdlib and not args.load:
             parser.error("Specify --corpus, --stdlib, or --load")
 
@@ -506,6 +597,9 @@ def main() -> None:
 
     elif mode == "self-diagnostic":
         _run_self_diagnostic(args, arena, projector, synthesizer, verbose)
+
+    elif mode == "cartography":
+        _run_cartography(args, arena, projector, synthesizer, verbose)
 
     t_end = time.time()
     if verbose:

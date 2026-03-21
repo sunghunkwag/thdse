@@ -135,6 +135,7 @@ class ConstraintDecoder:
         max_meta_grammar_retries: int = 0,
         entropy_weight: float = 0.0,
         subtree_vocab: Optional[SubTreeVocabulary] = None,
+        wall_archive: Optional[Any] = None,
     ):
         self.arena = arena
         self.projector = projector
@@ -146,6 +147,7 @@ class ConstraintDecoder:
         self._atom_vocab: Dict[str, StructuralAtom] = {}
         self._meta_grammar_log: List[MetaGrammarEvent] = []
         self._subtree_vocab = subtree_vocab
+        self._wall_archive = wall_archive
         self._build_vocabulary()
 
     # ── Vocabulary construction ──────────────────────────────────
@@ -1164,6 +1166,10 @@ class ConstraintDecoder:
         self._atom_vocab.clear()
         self._build_vocabulary()
 
+        # Revalidate walls after dimension expansion
+        if self._wall_archive is not None:
+            self._wall_archive.revalidate_walls(self, self.projector)
+
         # Expand the projection's phase arrays
         new_ast_phases = expand_phases(projection.ast_phases, new_dim)
         new_cfg_phases = (
@@ -1258,6 +1264,8 @@ class ConstraintDecoder:
             )
             if folding_result is not None:
                 compiled_ast, core_result = folding_result
+                if self._wall_archive is not None and core_result is not None:
+                    self._wall_archive.record(core_result, synthesis_context=str(input_))
                 self._meta_grammar_log.append(MetaGrammarEvent(
                     trigger="unsat_quotient_folding",
                     old_dimension=old_dim,
