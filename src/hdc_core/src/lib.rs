@@ -434,6 +434,77 @@ impl FhrrArena {
         Ok(total_projected)
     }
 
+    /// Compute the upper triangle of the pairwise correlation matrix
+    /// for a list of handles. Returns a flat Vec<f32> of length N*(N-1)/2
+    /// in row-major upper-triangle order:
+    ///   [(0,1), (0,2), ..., (0,N-1), (1,2), ..., (N-2,N-1)]
+    ///
+    /// Each correlation is the standard FHRR cosine: Re(V_a^H · V_b) / d.
+    ///
+    /// This replaces N*(N-1)/2 individual Python→Rust round trips with
+    /// a single call. The algorithm is still O(N²·d) but executes entirely
+    /// in Rust with cache-friendly sequential memory access.
+    pub fn correlate_matrix(&self, handles: Vec<usize>) -> PyResult<Vec<f32>> {
+        self.validate_handles(&handles)?;
+        let n = handles.len();
+        if n < 2 {
+            return Ok(Vec::new());
+        }
+        let num_pairs = n * (n - 1) / 2;
+        let mut result = Vec::with_capacity(num_pairs);
+        let floats = self.dimension * 2;
+        let inv_d = 1.0 / (self.dimension as f32);
+        let p_buf = self.buffer.as_ptr();
+
+        for i in 0..n {
+            let offset_i = handles[i] * floats;
+            for j in (i + 1)..n {
+                let offset_j = handles[j] * floats;
+                let corr = unsafe {
+                    self.correlate_pair_inner(p_buf, offset_i, offset_j, floats, inv_d)
+                };
+                result.push(corr);
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Compute correlations between every (query, target) pair.
+    /// Returns a flat Vec<f32> of length len(queries) * len(targets)
+    /// in row-major order: [q0·t0, q0·t1, ..., q0·tM, q1·t0, ...].
+    ///
+    /// queries and targets may overlap. Self-correlation pairs are
+    /// NOT excluded — the caller decides what to do with them.
+    pub fn correlate_matrix_subset(
+        &self, queries: Vec<usize>, targets: Vec<usize>,
+    ) -> PyResult<Vec<f32>> {
+        self.validate_handles(&queries)?;
+        self.validate_handles(&targets)?;
+        let nq = queries.len();
+        let nt = targets.len();
+        if nq == 0 || nt == 0 {
+            return Ok(Vec::new());
+        }
+        let mut result = Vec::with_capacity(nq * nt);
+        let floats = self.dimension * 2;
+        let inv_d = 1.0 / (self.dimension as f32);
+        let p_buf = self.buffer.as_ptr();
+
+        for i in 0..nq {
+            let offset_q = queries[i] * floats;
+            for j in 0..nt {
+                let offset_t = targets[j] * floats;
+                let corr = unsafe {
+                    self.correlate_pair_inner(p_buf, offset_q, offset_t, floats, inv_d)
+                };
+                result.push(corr);
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Extract the raw phase array (angles) from a handle. Used by Python
     /// to read back projected vectors without round-tripping through inject.
     pub fn extract_phases(&self, handle: usize) -> PyResult<Vec<f32>> {
@@ -568,6 +639,37 @@ impl FhrrArena {
             p_vec = p_vec.add(2);
         }
         Ok(())
+    }
+
+    /// Inner correlation computation for a single pair.
+    /// Computes Re(V_a^H · V_b) / d using scalar loop.
+    /// Called from correlate_matrix and correlate_matrix_subset.
+    ///
+    /// # Safety
+    /// Caller must ensure offset_a and offset_b are valid buffer offsets
+    /// and that p_buf points to the arena buffer with sufficient length.
+    #[inline]
+    unsafe fn correlate_pair_inner(
+        &self, p_buf: *const f32,
+        offset_a: usize, offset_b: usize,
+        floats: usize, inv_d: f32,
+    ) -> f32 {
+        let mut p1 = p_buf.add(offset_a);
+        let mut p2 = p_buf.add(offset_b);
+        let end = p1.add(floats);
+        let mut sum_real: f32 = 0.0;
+
+        while p1 < end {
+            let re1 = *p1;
+            let im1 = *p1.add(1);
+            let re2 = *p2;
+            let im2 = *p2.add(1);
+            sum_real += re1 * re2 + im1 * im2;
+            p1 = p1.add(2);
+            p2 = p2.add(2);
+        }
+
+        sum_real * inv_d
     }
 
     fn validate_handles(&self, handles: &[usize]) -> PyResult<()> {

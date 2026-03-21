@@ -106,6 +106,9 @@ class WallArchive:
         Same math as AxiomStore resonance, but over walls not code.
         Only operates on walls with status == "active".
 
+        Uses batch correlate_matrix when available to reduce Python→Rust
+        round trips from n*(n+1)/2 to 1 call + n self-correlation calls.
+
         Returns:
             Dictionary mapping (active_wall_idx_i, active_wall_idx_j)
             to correlation. Indices are positions within the active subset.
@@ -113,14 +116,36 @@ class WallArchive:
         active = [w for w in self._walls if w.status == "active"]
         matrix: Dict[Tuple[int, int], float] = {}
         n = len(active)
-        for i in range(n):
-            for j in range(i, n):
-                corr = self.arena.compute_correlation(
-                    active[i].v_error_handle,
-                    active[j].v_error_handle,
-                )
-                matrix[(i, j)] = corr
-                matrix[(j, i)] = corr
+        if n == 0:
+            return matrix
+
+        handles = [w.v_error_handle for w in active]
+        has_batch = hasattr(self.arena, 'correlate_matrix')
+
+        if has_batch and n >= 2:
+            # Self-correlations
+            for i in range(n):
+                corr = self.arena.compute_correlation(handles[i], handles[i])
+                matrix[(i, i)] = corr
+            # Upper triangle via single batch call
+            flat = self.arena.correlate_matrix(handles)
+            k = 0
+            for i in range(n):
+                for j in range(i + 1, n):
+                    matrix[(i, j)] = flat[k]
+                    matrix[(j, i)] = flat[k]
+                    k += 1
+        else:
+            # Fallback: individual calls
+            for i in range(n):
+                for j in range(i, n):
+                    corr = self.arena.compute_correlation(
+                        active[i].v_error_handle,
+                        active[j].v_error_handle,
+                    )
+                    matrix[(i, j)] = corr
+                    matrix[(j, i)] = corr
+
         return matrix
 
     def extract_wall_cliques(self, threshold: float = 0.3) -> List[List[int]]:
