@@ -489,6 +489,82 @@ class ConstraintDecoder:
         for v in order_vars.values():
             solver.add(v <= max_stmts)
 
+        # ── Hierarchical Nesting Constraints ─────────────────────────
+        # Add parent-child containment: parent_{Type} = -1 (top-level)
+        # or parent_{Type} = k (nested inside statement at order k).
+        parent_vars = {}
+        for stype in _STATEMENT_TYPES:
+            pv = z3.Int(f"parent_{stype}")
+            parent_vars[stype] = pv
+            vars_map[f"parent_{stype}"] = pv
+            # parent >= -1 and parent < order (no circular nesting)
+            solver.add(pv >= -1)
+            # If absent, parent = -1
+            solver.add(z3.Implies(
+                z3.Not(node_vars.get(stype, z3.BoolVal(False))),
+                pv == -1,
+            ))
+            # A statement's parent must come before it in the ordering
+            if stype in order_vars:
+                solver.add(z3.Implies(
+                    z3.And(node_vars.get(stype, z3.BoolVal(False)), pv >= 0),
+                    pv < order_vars[stype],
+                ))
+
+        # FunctionDef is always top-level
+        if "FunctionDef" in parent_vars and "FunctionDef" in node_vars:
+            solver.add(z3.Implies(
+                node_vars["FunctionDef"],
+                parent_vars["FunctionDef"] == -1,
+            ))
+
+        # Module is always top-level
+        if "Module" in parent_vars and "Module" in node_vars:
+            solver.add(z3.Implies(
+                node_vars["Module"],
+                parent_vars["Module"] == -1,
+            ))
+
+        # Nesting types: statements that can contain a body
+        _NESTING_TYPES = {"If", "While", "For", "AsyncFor", "With", "AsyncWith",
+                          "Try", "FunctionDef", "AsyncFunctionDef", "ClassDef"}
+
+        # CFG branch constraints → parent-child nesting (If → body_type)
+        for cond, body_type, _else_t in constraints.cfg_branches:
+            if (cond in node_vars and body_type in node_vars
+                    and cond in parent_vars and body_type in parent_vars
+                    and cond in order_vars and body_type in order_vars
+                    and cond in _NESTING_TYPES):
+                c = z3.Implies(
+                    z3.And(node_vars[cond], node_vars[body_type]),
+                    parent_vars[body_type] == order_vars[cond],
+                )
+                solver.push()
+                solver.add(c)
+                if solver.check() == z3.sat:
+                    solver.pop()
+                    solver.add(c)
+                else:
+                    solver.pop()  # Discard — would cause UNSAT
+
+        # CFG loop constraints → parent-child nesting (While/For → body_type)
+        for header, body_type in constraints.cfg_loops:
+            if (header in node_vars and body_type in node_vars
+                    and header in parent_vars and body_type in parent_vars
+                    and header in order_vars and body_type in order_vars
+                    and header in _NESTING_TYPES):
+                c = z3.Implies(
+                    z3.And(node_vars[header], node_vars[body_type]),
+                    parent_vars[body_type] == order_vars[header],
+                )
+                solver.push()
+                solver.add(c)
+                if solver.check() == z3.sat:
+                    solver.pop()
+                    solver.add(c)
+                else:
+                    solver.pop()  # Discard — would cause UNSAT
+
         # ── Topological Thermodynamics: Entropy Constraint ────────
         # Each active statement type carries a complexity cost.
         # The solver enforces maximum structural compression.
@@ -865,7 +941,11 @@ class ConstraintDecoder:
     # ── Phase 3: AST Compilation (Legacy) ─────────────────────────
 
     def compile_model(self, model: z3.ModelRef, vars_map: Dict) -> ast.Module:
-        """Compile a Z3 satisfying model into a Python AST."""
+        """Compile a Z3 satisfying model into a Python AST.
+
+        Uses parent_{Type} variables (if present) to build a proper nested tree
+        instead of placing all statements as flat siblings.
+        """
         present_stmts = []
         for stype in _STATEMENT_TYPES:
             var_name = f"present_{stype}"
@@ -881,7 +961,16 @@ class ConstraintDecoder:
                             order_int = 0
                     else:
                         order_int = 0
-                    present_stmts.append((order_int, stype))
+                    # Extract parent assignment
+                    parent_var = f"parent_{stype}"
+                    parent_int = -1
+                    if parent_var in vars_map:
+                        parent_val = model.evaluate(vars_map[parent_var], model_completion=True)
+                        try:
+                            parent_int = parent_val.as_long()
+                        except (AttributeError, Exception):
+                            parent_int = -1
+                    present_stmts.append((order_int, stype, parent_int))
 
         present_stmts.sort(key=lambda x: (x[0], x[1]))
 
@@ -893,27 +982,56 @@ class ConstraintDecoder:
                 if z3.is_true(val):
                     present_exprs.add(etype)
 
-        body_stmts = []
-        func_body = []
-        in_function = False
+        # Build an order→(stype, node, parent_order) map for tree assembly
+        order_to_node = {}
+        func_order = None
 
-        for _, stype in present_stmts:
+        for order_int, stype, parent_int in present_stmts:
             if stype == "Module":
                 continue
             if stype == "FunctionDef":
-                in_function = True
+                func_order = order_int
                 continue
-
             node = self._make_statement_node(stype, present_exprs)
             if node is not None:
-                if in_function:
-                    func_body.append(node)
-                else:
-                    body_stmts.append(node)
+                order_to_node[order_int] = (stype, node, parent_int)
 
-        if in_function:
-            if not func_body:
-                func_body = [ast.Pass()]
+        # Nesting types: statements whose AST nodes have a .body list
+        _NESTING_STYPES = {"If", "While", "For", "AsyncFor", "With", "AsyncWith",
+                           "Try", "FunctionDef", "AsyncFunctionDef", "ClassDef"}
+
+        # Assemble tree using parent assignments
+        # Pass 1: collect top-level nodes and children
+        top_level = []
+        children_of = {}  # order_int -> list of child nodes
+
+        for order_int in sorted(order_to_node.keys()):
+            stype, node, parent_int = order_to_node[order_int]
+            if parent_int < 0:
+                # Top-level (inside function body if function present, else module body)
+                top_level.append(node)
+            else:
+                # Find the parent statement at the given order position
+                if parent_int in order_to_node:
+                    parent_stype, parent_node, _ = order_to_node[parent_int]
+                    if parent_stype in _NESTING_STYPES and hasattr(parent_node, 'body'):
+                        # Remove placeholder Pass from parent body if present
+                        if (len(parent_node.body) == 1
+                                and isinstance(parent_node.body[0], ast.Pass)):
+                            parent_node.body.clear()
+                        parent_node.body.append(node)
+                    else:
+                        # Parent doesn't support nesting, fall back to sibling
+                        top_level.append(node)
+                else:
+                    # Parent is FunctionDef (at func_order) — treat as top-level
+                    # (will be placed in function body below)
+                    top_level.append(node)
+
+        # Wrap in function if FunctionDef was present
+        has_function = func_order is not None
+        if has_function:
+            func_body = top_level if top_level else [ast.Pass()]
             func_def = ast.FunctionDef(
                 name="synthesized_fn",
                 args=ast.arguments(
@@ -924,7 +1042,9 @@ class ConstraintDecoder:
                 decorator_list=[],
                 returns=None,
             )
-            body_stmts.insert(0, func_def)
+            body_stmts = [func_def]
+        else:
+            body_stmts = top_level
 
         if not body_stmts:
             body_stmts = [ast.Pass()]

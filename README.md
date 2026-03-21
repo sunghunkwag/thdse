@@ -642,6 +642,18 @@ Notable findings:
 
 ## Changelog
 
+### v0.7.1 — Hierarchical Nesting Decoder + Empirical Validation
+
+**Upgrade 1 — Hierarchical Nesting Constraints.** The legacy atom-based decoder now encodes parent-child containment relationships via Z3 `parent_{Type}` variables, not just flat ordering. CFG branch and loop constraints generate nesting implications: `If → body` and `While/For → body` statements are assembled as children, not siblings. `compile_model()` builds a proper AST tree from the Z3 model's parent assignments. Incremental consistency filtering (push/pop) ensures graceful fallback to flat placement when nesting would cause UNSAT.
+
+**Upgrade 2 — Empirical Validation Report.** New `--mode empirical` CLI mode runs a reproducible stdlib analysis pipeline and outputs `empirical_validation.json` + `empirical_validation.md`. Reports ingestion stats, resonance matrix statistics, verified structural family cliques (with intra/inter-clique resonance), top-20 cross-directory pairs with per-layer decomposition, and structural outliers. Memory-bounded to run within 4GB.
+
+**Fix 1 — Consensus Arena Capacity.** `SwarmOrchestrator` temporary arena capacity formula changed from `4N + 100` to `max(5N + 50, 200)`, preventing capacity exhaustion when layered consensus injects 4x candidate handles.
+
+**Fix 2 — Agent Per-Layer Phase Check.** Unified `ast_phases`/`cfg_phases`/`data_phases` null checks in `ThdseAgent` to `is not None and len > 0`, fixing inconsistent truthiness check that could silently drop empty AST phase arrays.
+
+**Tests.** 6 new tests: 4 nesting decoder (if-body nested, loop-body nested, flat fallback, regression guard) + 2 empirical report (smoke, pair decomposition). All 94 tests pass.
+
 ### v0.7.0 — Three Structural Upgrades + Three Structural Fixes
 
 This release addresses six algebraic deficiencies in the swarm consensus, wall broadcast, bundling, and communication mechanisms.

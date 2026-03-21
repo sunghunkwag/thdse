@@ -724,9 +724,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["analysis", "diff", "refactor", "synthesis", "self-diagnostic", "cartography", "serl", "swarm"],
+        choices=["analysis", "diff", "refactor", "synthesis", "self-diagnostic", "cartography", "serl", "swarm", "empirical"],
         default="analysis",
-        help="Pipeline mode: analysis (default), diff, refactor, synthesis, self-diagnostic, cartography, serl, swarm.",
+        help="Pipeline mode: analysis (default), diff, refactor, synthesis, self-diagnostic, cartography, serl, swarm, empirical.",
     )
     parser.add_argument(
         "--corpus",
@@ -815,6 +815,8 @@ def main() -> None:
         # Swarm mode uses --stdlib by default if no --corpus provided
         if not args.corpus and not args.stdlib:
             args.stdlib = True
+    elif mode == "empirical":
+        pass  # No corpus required — runs its own pipeline
     elif mode in ("analysis", "refactor", "synthesis", "cartography", "serl"):
         if not args.corpus and not args.stdlib and not args.load:
             parser.error("Specify --corpus, --stdlib, or --load")
@@ -826,6 +828,26 @@ def main() -> None:
         if verbose:
             print(f"Initializing swarm mode (d={args.dimension})")
         _run_swarm(args, verbose)
+        t_end = time.time()
+        if verbose:
+            print(f"\nDone in {t_end - t_start:.1f}s")
+        return
+
+    # Empirical mode manages its own pipeline
+    if mode == "empirical":
+        from src.analysis.empirical_report import generate_empirical_report
+        if verbose:
+            print(f"Running empirical validation (d={args.dimension}, max_files={args.max_files or 300})")
+        report = generate_empirical_report(
+            output_path=args.output,
+            max_files=args.max_files if args.max_files > 0 else 300,
+            dimension=args.dimension,
+        )
+        if verbose:
+            print(f"  Ingested: {report['ingestion']['ingested']}")
+            print(f"  Cliques (size >= 3): {report['cliques']['total_size_3_plus']}")
+            print(f"  Verified families: {len(report['cliques']['verified_families'])}")
+            print(f"  Output: {args.output}/empirical_validation.json")
         t_end = time.time()
         if verbose:
             print(f"\nDone in {t_end - t_start:.1f}s")
