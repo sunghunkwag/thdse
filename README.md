@@ -72,6 +72,21 @@ A strictly deterministic architecture that mathematically synthesizes new code s
                          │ > 0 → space is open                │
                          │ = 0 for K cycles → space closed    │
                          └──────────────────────────────────┘
+
+                         ┌──────────────────────────────────┐
+                         │   SWARM (Collective Intelligence)  │
+                         │                                   │
+                         │ N agents × independent pipelines  │
+                         │ Communication: raw phase arrays    │
+                         │ Consensus: correlate_matrix +      │
+                         │   Bron-Kerbosch clique extraction  │
+                         │ UNSAT → Global Quotient Collapse   │
+                         │   (broadcast V_error to all agents)│
+                         │                                   │
+                         │ Heterogeneous corpora → diverse    │
+                         │   resonance landscapes →           │
+                         │   collective > any individual      │
+                         └──────────────────────────────────┘
 ```
 
 ## Modules
@@ -382,7 +397,83 @@ This provides semantic classification of code evolution that textual diff cannot
 - Temporal change classification for version-to-version comparisons
 - Linkage matrix for external dendrogram visualization
 
-### 11. CLI Entry Point (`src/discover.py`)
+### 11. Swarm — Multi-Agent Collective Intelligence (`src/swarm/`)
+
+The THDSE-Swarm extends the single-agent synthesis pipeline into a deterministic multi-agent collective intelligence system. N agents communicate exclusively via raw FHRR phase arrays — no text, no LLMs, no natural language. Each agent is an independent THDSE instance with its own arena, projector, synthesizer, decoder, wall archive, sandbox, and SERL loop. A central orchestrator aggregates candidate vectors via algebraic consensus.
+
+#### Architecture
+
+```
+┌──────────────────────────────────────────────────────┐
+│                  SwarmOrchestrator                     │
+│                                                       │
+│  Collects V_cand from all agents                      │
+│  → correlate_matrix (single FFI call)                 │
+│  → Bron-Kerbosch clique extraction (ρ > 0.85)        │
+│  → bundle clique members → consensus centroid         │
+│  → ConstraintDecoder → Z3 → Python AST               │
+│  → If UNSAT: extract V_error → broadcast to all       │
+│  → If SAT: ExecutionSandbox → fitness → expand vocab  │
+└──────┬──────┬──────┬──────┬───────────────────────────┘
+       │      │      │      │
+  ┌────▼───┐┌─▼────┐┌▼─────┐┌▼────────┐
+  │Agent 0 ││Agent 1││Agent 2││Agent N-1│
+  │ Arena  ││ Arena ││ Arena ││ Arena   │
+  │ Synth  ││ Synth ││ Synth ││ Synth   │
+  │ Decoder││Decoder││Decoder││ Decoder │
+  │ SERL   ││ SERL  ││ SERL  ││ SERL    │
+  │Corpus: ││Corpus:││Corpus:││Corpus:  │
+  │ math/* ││ sys/* ││ net/* ││custom/* │
+  └────────┘└──────┘└──────┘└─────────┘
+```
+
+**Critical design constraint — Agent Heterogeneity**: Each agent ingests a DIFFERENT corpus. Identical agents produce identical resonance landscapes and provide no collective intelligence gain. Heterogeneous corpora produce complementary wall archives and vocabularies. An UNSAT in Agent A's space may be SAT in Agent B's space.
+
+#### VSA2VSA Communication Protocol (`src/swarm/protocol.py`)
+
+Agents communicate via `PhaseMessage` — a minimal header (JSON, ≤200 bytes: sender_id, message_type, metadata, timestamp) followed by a raw float32 array (phases packed via `struct.pack`, not JSON-encoded strings). Message types: `"candidate"` (synthesis output), `"wall"` (V_error broadcast), `"target"` (goal injection), `"ack"`. For d=256, total message size is ~1.2 KB.
+
+`SwarmConfig` parameterizes a swarm run: n_agents, dimension, arena_capacity, consensus_threshold (default: 0.85), fitness_threshold (default: 0.4), max_rounds, stagnation_limit, and per-agent corpus_paths.
+
+#### ThdseAgent (`src/swarm/agent.py`)
+
+A self-contained THDSE instance with its own `FhrrArena`, `IsomorphicProjector`, `AxiomaticSynthesizer`, `ConstraintDecoder`, `SubTreeVocabulary`, `WallArchive`, `ExecutionSandbox`, and `VocabularyExpander`. Each agent:
+
+- **Ingests** its assigned corpus directories (or inline dict for testing)
+- **Runs local synthesis**: compute resonance → extract cliques → synthesize → decode → execute → SERL gating (only candidates with fitness ≥ 0.4 are emitted as `PhaseMessage`)
+- **Receives wall broadcasts**: injects V_error into local arena → `project_to_quotient_space` → records wall
+- **Receives consensus**: attempts to decode and expand local vocabulary from the consensus vector
+
+#### Resonance Clique Consensus (`src/swarm/consensus.py`)
+
+Given N candidate vectors from M agents:
+1. Inject all candidates into a temporary arena (fresh each round, never corrupts agent arenas)
+2. `correlate_matrix()` — single FFI call for the N×N correlation matrix
+3. Build adjacency graph where edge exists iff ρ > consensus_threshold
+4. Bron-Kerbosch maximal clique extraction
+5. Select largest clique (ties broken by mean resonance)
+6. Bundle clique members into centroid vector via `arena.bundle()`
+7. Return `ConsensusResult` with centroid phases, clique membership, and contributing agent IDs
+
+#### SwarmOrchestrator (`src/swarm/orchestrator.py`)
+
+Each round:
+1. Each agent runs local synthesis → emits candidate `PhaseMessage`s
+2. Orchestrator collects all candidates
+3. Compute consensus via `compute_swarm_consensus`
+4. Decode consensus centroid using the orchestrator's **merged vocabulary** (union of all agents' `SubTreeVocabulary` atoms — can decode structures no single agent could)
+5. If SAT and fitness ≥ threshold: broadcast consensus to all agents for local vocabulary expansion
+6. If UNSAT: broadcast V_error to ALL agents → **Global Quotient Collapse** (every agent projects out the contradiction axis from its entire memory space)
+7. Track metrics: rounds, consensus rate, walls, vocabulary growth, best fitness
+8. Halt when: max_rounds reached OR stagnation_limit consecutive zero-progress rounds
+
+`SwarmResult` records the full round history, per-agent stats, convergence diagnosis, and f_eff_expansion_rate.
+
+#### Swarm SERL (`src/swarm/swarm_serl.py`)
+
+Top-level entry point `run_swarm_serl(config)` wraps the orchestrator in a SERL-compatible measurement framework: creates the orchestrator, runs the loop, returns `SwarmResult`.
+
+### 12. CLI Entry Point (`src/discover.py`)
 Multi-mode orchestration of the full pipeline, selectable via `--mode`:
 
 ```bash
@@ -407,6 +498,12 @@ python src/discover.py --mode cartography --corpus ./projects/ --output ./report
 # SERL: closed-loop synthesis-execution-reingestion with vocabulary expansion
 python src/discover.py --mode serl --corpus ./projects/ --output ./report/
 
+# Swarm: multi-agent collective intelligence via FHRR phase arrays
+python src/discover.py --mode swarm --stdlib --n-agents 3 --output ./report/
+
+# Swarm with explicit per-agent corpora
+python src/discover.py --mode swarm --corpus ./math/ ./sys/ ./net/ --n-agents 3 --output ./report/
+
 # Analyze one or more project directories
 python src/discover.py --corpus ./project_a/ ./project_b/ --output ./report/
 
@@ -417,7 +514,7 @@ python src/discover.py --corpus ./projects/ --save corpus.pkl --output ./report/
 python src/discover.py --load corpus.pkl --output ./report/
 ```
 
-Configurable parameters: `--dimension` (default: 256), `--capacity` (default: 2M handles), `--threshold` (resonance τ, default: 0.15), `--max-files`.
+Configurable parameters: `--dimension` (default: 256), `--capacity` (default: 2M handles), `--threshold` (resonance τ, default: 0.15), `--max-files`, `--n-agents` (swarm mode, default: 3), `--consensus-threshold` (swarm mode, default: 0.85).
 
 ## Project Structure
 
@@ -453,6 +550,12 @@ thdse/
 │   │   ├── refactoring_detector.py # Duplicate & unification detection
 │   │   ├── temporal_diff.py       # Version-to-version change classification
 │   │   └── boundary_cartography.py # Design space boundary mapping
+│   ├── swarm/                 # Multi-agent collective intelligence
+│   │   ├── protocol.py            # PhaseMessage, SwarmConfig, serialization
+│   │   ├── consensus.py           # Resonance clique consensus (Bron-Kerbosch)
+│   │   ├── agent.py               # ThdseAgent (independent THDSE pipeline)
+│   │   ├── orchestrator.py        # SwarmOrchestrator (Global Quotient Collapse)
+│   │   └── swarm_serl.py          # Swarm-level SERL entry point
 │   ├── utils/                 # Phase algebra utilities
 │   │   └── arena_ops.py
 │   └── discover.py            # CLI entry point (multi-mode)
@@ -463,7 +566,8 @@ thdse/
 │   ├── test_batch_correlation.py  # Batch correlation correctness & equivalence tests
 │   ├── test_execution_sandbox.py  # Execution sandbox fitness tests (9 tests)
 │   ├── test_vocab_expander.py     # Vocabulary expansion tests (6 tests)
-│   └── test_serl.py               # SERL loop tests (5 tests)
+│   ├── test_serl.py               # SERL loop tests (5 tests)
+│   └── test_swarm.py              # Swarm integration tests (10 tests)
 ├── run_tests.py
 ├── requirements.txt
 └── Cargo.toml
@@ -492,6 +596,9 @@ python src/discover.py --stdlib --output ./report/
 
 # Run Ouroboros self-diagnostic
 python src/discover.py --mode self-diagnostic --output ./report/
+
+# Run multi-agent swarm (3 agents, stdlib partitioned automatically)
+python src/discover.py --mode swarm --stdlib --n-agents 3 --output ./report/
 ```
 
 ## Empirical Validation
@@ -525,9 +632,30 @@ Notable findings:
 - **SERL monotonicity**: the vocabulary size is monotonically non-decreasing across SERL cycles — no atoms are ever removed. The fitness gate (θ = 0.4) ensures only code that compiles, executes, and produces nontrivial computation can expand the vocabulary. Idempotency is enforced by SHA-256 deduplication: identical canonical sub-trees are never counted twice. The F_eff expansion rate (new_atoms / total_syntheses) is a well-defined, deterministic scalar that quantifies whether design space self-expansion has occurred.
 - **Subprocess isolation**: synthesized code executes in a separate OS process via `subprocess.run()` with timeout, providing hard security boundaries. No shared memory, no capability inheritance, no `__subclasses__()` escape vectors. If the child process crashes, hangs, or produces malformed output, it is killed and scored at fitness = 0.15.
 - **Boundary convergence**: the cartography loop is monotonically non-expansive — each iteration either discovers a new wall (reducing the residual dimension) or produces a successful synthesis (demonstrating reachability), guaranteeing termination within max(d, max_iterations) steps. The residual dimension estimate provides a quantitative convergence certificate: when d_eff < 0.1 · d, the design space is classified as closed.
+- **Swarm consensus correctness**: the consensus centroid is computed by bundling (⊕) all clique members — identical to single-agent bundle semantics. The temporary consensus arena is created fresh each round and discarded after, ensuring zero cross-contamination with agent arenas. Agent heterogeneity (different corpora → different resonance landscapes) is the mechanism that provides collective capability: structures that are UNSAT in one agent's quotient space may be SAT in another's, and the merged orchestrator vocabulary can decode structures unreachable by any individual agent.
 - **Batch correlation exactness**: `correlate_matrix` computes the identical FHRR cosine Re(V_a^H · V_b) / d as `compute_correlation`, executed over all N*(N-1)/2 pairs in a single Rust FFI call. The result is bitwise identical to N*(N-1)/2 individual calls within float32 arithmetic. No approximation, no hashing, no false negatives — the speedup derives entirely from eliminating Python→Rust call overhead and exploiting cache-friendly sequential memory access.
 
 ## Changelog
+
+### v0.6.0 — THDSE-Swarm: Deterministic Multi-Agent Collective Intelligence
+
+This release introduces the Swarm subsystem: N independent THDSE agents that communicate exclusively via raw FHRR phase arrays and achieve algebraic consensus through resonance clique extraction.
+
+**VSA2VSA Protocol.** Agents exchange `PhaseMessage` values containing raw float32 phase arrays (packed via `struct.pack` for precision preservation) with minimal JSON metadata headers. No text communication, no natural language, no LLM calls — only algebraic signals.
+
+**ThdseAgent.** Each agent is a complete, independent THDSE pipeline with its own `FhrrArena`, projector, synthesizer, decoder, wall archive, sandbox, and vocabulary expander. SERL gating ensures only candidates with fitness ≥ 0.4 are emitted to the swarm communication channel; low-quality candidates never leave the agent.
+
+**Resonance Clique Consensus.** Candidate vectors from all agents are injected into a temporary arena (created fresh each round), correlated via a single `correlate_matrix` FFI call, and submitted to Bron-Kerbosch clique extraction. The largest clique above the consensus threshold (default: ρ > 0.85) is bundled into a centroid vector representing the algebraic consensus.
+
+**Global Quotient Collapse.** When the orchestrator's decoder returns UNSAT for the consensus centroid, the contradiction vector V_error is broadcast to ALL agents, each of which immediately projects its entire arena to the quotient space H/⟨V_error⟩. This collapses the contradiction axis from every agent's memory simultaneously — a coordinated algebraic operation that no single agent could perform in isolation.
+
+**Merged Vocabulary.** The orchestrator's decoder merges `SubTreeVocabulary` atoms from all agents, enabling it to decode structures that no individual agent could decode alone. This is the mechanism by which heterogeneous corpora produce collective capability exceeding any individual.
+
+**Corpus Partitioning.** When fewer corpus directories than agents are provided, the CLI automatically partitions the stdlib into N non-overlapping segments, ensuring agent heterogeneity.
+
+**CLI Integration.** `--mode swarm` with `--n-agents` (default: 3) and `--consensus-threshold` (default: 0.85). Outputs `swarm_result.json` with per-round and per-agent metrics.
+
+**Tests.** 10 new integration tests: agent initialization and corpus ingestion, local synthesis candidate emission, wall broadcast propagation, consensus from identical candidates (clique size 3), no consensus from orthogonal candidates, two-agent swarm smoke test, heterogeneous candidate verification, Global Quotient Collapse consistency across 3 agents, protocol serialization round-trip, and swarm SERL entry point validation. All 76 tests pass (66 existing + 10 new).
 
 ### v0.5.0 — SERL: Synthesis-Execution-Reingestion Loop
 
