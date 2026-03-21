@@ -306,6 +306,134 @@ impl FhrrArena {
         unsafe { self.project_to_quotient_space_simd(v_error_id) }
     }
 
+    /// Project the arena into the quotient space H / <V₁, V₂, ..., Vₙ>.
+    ///
+    /// Unlike single-vector projection, this removes the ENTIRE subspace
+    /// spanned by the given vectors, not just one axis at a time.
+    ///
+    /// Algorithm:
+    ///   1. Gram-Schmidt orthogonalize the V_error vectors
+    ///      (ensures sequential projection is mathematically equivalent
+    ///       to simultaneous subspace removal)
+    ///   2. For each orthogonalized basis vector, project it out from
+    ///      all live arena vectors (reusing project_to_quotient_space_simd)
+    ///
+    /// This is O(k² × d + k × head × d) where k = number of walls.
+    ///
+    /// Args:
+    ///   v_error_ids: Vec<usize> — arena handles of all V_error vectors
+    ///
+    /// Returns:
+    ///   Number of vectors modified.
+    pub fn project_to_multi_quotient_space(
+        &mut self, v_error_ids: Vec<usize>,
+    ) -> PyResult<usize> {
+        if v_error_ids.is_empty() {
+            return Ok(0);
+        }
+        self.validate_handles(&v_error_ids)?;
+
+        let floats = self.dimension * 2;
+        let k = v_error_ids.len();
+
+        // Step 1: Copy V_error vectors to temporary workspace for Gram-Schmidt
+        let mut workspace: Vec<Vec<f32>> = Vec::with_capacity(k);
+        for &vid in &v_error_ids {
+            let offset = vid * floats;
+            workspace.push(self.buffer[offset..offset + floats].to_vec());
+        }
+
+        // Step 2: Gram-Schmidt orthogonalization using complex inner products
+        // For i in 1..k: for j in 0..i: V_i -= V_j * (<V_j, V_i> / <V_j, V_j>)
+        // then normalize V_i
+        for i in 1..k {
+            for j in 0..i {
+                // Complex inner product <V_j, V_i> = V_j^H · V_i
+                // = Σ_d conj(V_j[d]) · V_i[d]
+                let mut dot_re: f32 = 0.0;
+                let mut dot_im: f32 = 0.0;
+                let mut norm_sq: f32 = 0.0;
+
+                for d in 0..self.dimension {
+                    let vj_re = workspace[j][2 * d];
+                    let vj_im = workspace[j][2 * d + 1];
+                    let vi_re = workspace[i][2 * d];
+                    let vi_im = workspace[i][2 * d + 1];
+
+                    // <V_j, V_i> = conj(V_j) · V_i
+                    dot_re += vj_re * vi_re + vj_im * vi_im;
+                    dot_im += vj_re * vi_im - vj_im * vi_re;
+
+                    // ||V_j||² = conj(V_j) · V_j (always real)
+                    norm_sq += vj_re * vj_re + vj_im * vj_im;
+                }
+
+                if norm_sq < 1e-12 {
+                    continue; // Skip near-zero basis vector
+                }
+
+                // Projection coefficient: c = <V_j, V_i> / ||V_j||²
+                let inv_norm_sq = 1.0 / norm_sq;
+                let coeff_re = dot_re * inv_norm_sq;
+                let coeff_im = dot_im * inv_norm_sq;
+
+                // V_i -= V_j * c (complex scalar-vector multiply)
+                for d in 0..self.dimension {
+                    let vj_re = workspace[j][2 * d];
+                    let vj_im = workspace[j][2 * d + 1];
+                    // V_j * c: (vj_re * c_re - vj_im * c_im, vj_re * c_im + vj_im * c_re)
+                    let proj_re = vj_re * coeff_re - vj_im * coeff_im;
+                    let proj_im = vj_re * coeff_im + vj_im * coeff_re;
+                    workspace[i][2 * d] -= proj_re;
+                    workspace[i][2 * d + 1] -= proj_im;
+                }
+            }
+
+            // Normalize V_i to unit magnitude per component
+            for d in 0..self.dimension {
+                let re = workspace[i][2 * d];
+                let im = workspace[i][2 * d + 1];
+                let mag = (re * re + im * im).sqrt();
+                if mag > 1e-12 {
+                    let inv_mag = 1.0 / mag;
+                    workspace[i][2 * d] = re * inv_mag;
+                    workspace[i][2 * d + 1] = im * inv_mag;
+                }
+            }
+        }
+
+        // Step 3: Inject orthogonalized basis vectors into temporary arena slots
+        // and project each one out sequentially
+        let mut total_projected: usize = 0;
+
+        for i in 0..k {
+            // Check if this basis vector is non-zero
+            let mut norm_sq: f32 = 0.0;
+            for d in 0..self.dimension {
+                let re = workspace[i][2 * d];
+                let im = workspace[i][2 * d + 1];
+                norm_sq += re * re + im * im;
+            }
+            if norm_sq < 1e-12 {
+                continue; // Linearly dependent — skip
+            }
+
+            // Allocate a temporary handle for the orthogonalized vector
+            let temp_h = self.allocate()?;
+
+            // Inject the orthogonalized vector
+            let temp_offset = temp_h * floats;
+            self.buffer[temp_offset..temp_offset + floats]
+                .copy_from_slice(&workspace[i]);
+
+            // Project it out from all arena vectors
+            let count = unsafe { self.project_to_quotient_space_simd(temp_h)? };
+            total_projected += count;
+        }
+
+        Ok(total_projected)
+    }
+
     /// Extract the raw phase array (angles) from a handle. Used by Python
     /// to read back projected vectors without round-tripping through inject.
     pub fn extract_phases(&self, handle: usize) -> PyResult<Vec<f32>> {
