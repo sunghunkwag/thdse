@@ -76,6 +76,8 @@ Rust library (PyO3 bindings) implementing an FHRR memory arena:
 - `bind(h1, h2, out)` → complex element-wise multiplication (⊗), AVX2 SIMD
 - `bundle(handles, out)` → superposition + normalize (⊕), AVX2 SIMD
 - `compute_correlation(h1, h2)` → cosine similarity in complex domain
+- `correlate_matrix(handles)` → full upper-triangle pairwise correlation matrix in a single FFI call; returns flat `Vec<f32>` of length N*(N-1)/2 in row-major order
+- `correlate_matrix_subset(queries, targets)` → asymmetric correlation matrix between query and target handle sets; returns flat `Vec<f32>` of length |Q|×|T| in row-major order
 - `expand_dimension(new_dim)` → meta-grammar emergence via conjugate reflection
 - `bind_bundle_fusion(h, handles, out)` → fused algebraic operator A ⊗ (B₁ ⊕ … ⊕ Bₖ)
 - `compute_entropy(h)` → thermodynamic cost S(h) = n_bind·ln2 + n_bundle·ln2
@@ -355,7 +357,8 @@ thdse/
 ├── tests/
 │   ├── test_decoder_subtree.py    # Sub-tree vocabulary & threading tests
 │   ├── test_structural_diff.py    # Structural diff engine tests
-│   └── test_boundary_cartography.py # Boundary cartography & wall archive tests
+│   ├── test_boundary_cartography.py # Boundary cartography & wall archive tests
+│   └── test_batch_correlation.py  # Batch correlation correctness & equivalence tests
 ├── run_tests.py
 ├── requirements.txt
 └── Cargo.toml
@@ -415,8 +418,21 @@ Notable findings:
 - **Sub-tree compositionality**: the sub-tree vocabulary preserves the algebraic guarantees of the atom vocabulary while operating over concrete AST fragments. Canonicalization is deterministic (pre-order traversal with positional placeholder assignment), deduplication is collision-resistant (SHA-256), and variable threading is near-linear (union-find with path compression and union by rank). The assembled output is verified via `compile()` to ensure syntactic validity.
 - **Multi-quotient correctness**: the multi-vector quotient projection H/⟨V₁, …, Vₖ⟩ first orthogonalizes the wall vectors via Gram-Schmidt with complex inner products, then applies sequential single-vector projection. The Gram-Schmidt step ensures that sequential projection is mathematically equivalent to simultaneous subspace removal, eliminating order-dependent numerical drift inherent in naïve sequential application. Linearly dependent wall vectors are detected (‖Vᵢ‖² < ε) and excluded, preventing rank-deficient projections.
 - **Boundary convergence**: the cartography loop is monotonically non-expansive — each iteration either discovers a new wall (reducing the residual dimension) or produces a successful synthesis (demonstrating reachability), guaranteeing termination within max(d, max_iterations) steps. The residual dimension estimate provides a quantitative convergence certificate: when d_eff < 0.1 · d, the design space is classified as closed.
+- **Batch correlation exactness**: `correlate_matrix` computes the identical FHRR cosine Re(V_a^H · V_b) / d as `compute_correlation`, executed over all N*(N-1)/2 pairs in a single Rust FFI call. The result is bitwise identical to N*(N-1)/2 individual calls within float32 arithmetic. No approximation, no hashing, no false negatives — the speedup derives entirely from eliminating Python→Rust call overhead and exploiting cache-friendly sequential memory access.
 
 ## Changelog
+
+### v0.4.1 — Batch Correlation and Layer-Independent Exact Filtering
+
+This release eliminates the O(N²) Python→Rust round-trip overhead in all pairwise correlation consumers by introducing batch correlation primitives in the Rust HDC core and refactoring the Python-side consumers to exploit them.
+
+**Batch Correlation Primitives (Rust).** Two new methods on `FhrrArena`: `correlate_matrix(handles)` computes the full upper-triangle of the pairwise correlation matrix in a single FFI call, returning a flat `Vec<f32>` of length N*(N-1)/2; `correlate_matrix_subset(queries, targets)` computes the full |Q|×|T| asymmetric correlation matrix. Both execute the same FHRR cosine as `compute_correlation` — algebraically exact, zero approximation. The computation remains O(N²·d) but runs entirely inside Rust with sequential memory access, reducing wall-clock time by eliminating per-pair Python→Rust marshalling overhead.
+
+**ResonanceMatrix Refactor.** `compute_full()` replaces N*(N+1)/2 individual `compute_correlation` calls with a single `correlate_matrix` call plus N self-correlation calls. Output is bitwise identical within float32 epsilon.
+
+**RefactoringDetector Layer-Independent Exact Filtering.** The O(N²) Python loop calling `compare_layers()` (4 correlations per pair) is replaced by per-layer batch matrix computation. Rule 1 (structural duplicate: sim_ast > 0.7 ∧ sim_cfg > 0.7) computes the full AST correlation matrix, filters surviving pairs, then checks CFG correlations from a pre-computed CFG matrix. Rule 2 (interface unification: sim_data > 0.8 ∧ sim_ast < 0.3) computes the full data-dependency correlation matrix, filters, and checks the AST ceiling from the already-computed AST matrix. This approach avoids pre-filtering on the composite `final_handle` (which would dilute layer-specific signals and introduce false negatives for Rule 2), while reducing the call count from 4·N*(N-1)/2 individual FFI calls to 2–3 batch calls.
+
+**WallArchive Refactor.** `compute_wall_resonance()` replaces n*(n+1)/2 individual calls with a single `correlate_matrix` call plus n self-correlation calls.
 
 ### v0.4.0 — Boundary Cartography
 
