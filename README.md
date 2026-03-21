@@ -567,7 +567,7 @@ thdse/
 │   ├── test_execution_sandbox.py  # Execution sandbox fitness tests (9 tests)
 │   ├── test_vocab_expander.py     # Vocabulary expansion tests (6 tests)
 │   ├── test_serl.py               # SERL loop tests (5 tests)
-│   └── test_swarm.py              # Swarm integration tests (10 tests)
+│   └── test_swarm.py              # Swarm integration tests (22 tests)
 ├── run_tests.py
 ├── requirements.txt
 └── Cargo.toml
@@ -635,14 +635,16 @@ Notable findings:
 - **Swarm consensus correctness**: the consensus centroid is computed by weighted bundling (⊕) of clique members, where weights derive from pairwise resonance within the clique. The temporary consensus arena is created fresh each round and discarded after, ensuring zero cross-contamination with agent arenas. Agent heterogeneity (different corpora → different resonance landscapes) is the mechanism that provides collective capability: structures that are UNSAT in one agent's quotient space may be SAT in another's, and the merged orchestrator vocabulary can decode structures unreachable by any individual agent.
 - **Weighted bundle correctness**: `weighted_bundle_phases` computes atan2(Σ w_i sin θ_i, Σ w_i cos θ_i) per dimension — the maximum-likelihood estimator of the circular mean under von Mises weighting. When all weights are equal, this reduces exactly to standard `bundle_phases`. The output satisfies the FHRR unit-magnitude invariant after `inject_phases` (which normalizes to |z_j| = 1).
 - **Layered partial consensus soundness**: adjacency rules form a logical OR over independent per-layer correlations. Rule 2 (CFG ∧ Data) detects algorithmic isomorphism — structurally different code that implements the same control flow and data wiring. False positive rate is bounded by the product of per-layer false positive rates (independence assumption under high-dimensional FHRR concentration of measure).
-- **Quotient isolation safety**: targeted wall broadcast preserves non-participating agents' design spaces. The quotient projection H → H/⟨V_error⟩ is applied only to agents whose synthesis contributed to the contradiction, preventing autoimmune collapse of orthogonal design regions.
+- **Quotient isolation safety**: targeted wall broadcast preserves non-participating agents' design spaces. The quotient projection H → H/⟨V_error⟩ is applied only to agents whose synthesis contributed to the contradiction, preventing autoimmune collapse of orthogonal design regions. Drift reconciliation propagates aged walls (older than `drift_grace_period` rounds) to non-participating agents, preventing long-term topological fragmentation while preserving short-term isolation benefits.
+- **Rule-aware effective correlation**: clique scoring and member weighting use rule-appropriate correlation metrics. For algo_iso edges, the effective correlation is mean(cfg_corr, data_corr); for struct_iso edges, mean(ast_corr, cfg_corr); for full edges, final_corr. This prevents geometric discrimination where algo_iso cliques are penalized by their inherently low final_corr (which is dominated by the differing AST component after cross-layer binding).
+- **Phase quantization precision**: layer phases are quantized to uint16 during serialization, mapping [-π, π] to [0, 65535]. This provides ~0.0001 radian precision (~0.006 degrees), which is orders of magnitude below the FHRR correlation noise floor at d ≥ 64. The quantization error is bounded by π/32768 ≈ 9.6×10⁻⁵ radians per dimension. Final phases remain at float32 precision for decoding fidelity.
 - **Batch correlation exactness**: `correlate_matrix` computes the identical FHRR cosine Re(V_a^H · V_b) / d as `compute_correlation`, executed over all N*(N-1)/2 pairs in a single Rust FFI call. The result is bitwise identical to N*(N-1)/2 individual calls within float32 arithmetic. No approximation, no hashing, no false negatives — the speedup derives entirely from eliminating Python→Rust call overhead and exploiting cache-friendly sequential memory access.
 
 ## Changelog
 
-### v0.7.0 — Three Structural Upgrades
+### v0.7.0 — Three Structural Upgrades + Three Structural Fixes
 
-This release addresses three algebraic deficiencies in the swarm consensus, wall broadcast, and bundling mechanisms.
+This release addresses six algebraic deficiencies in the swarm consensus, wall broadcast, bundling, and communication mechanisms.
 
 **Upgrade 1 — Layered Partial Topological Consensus.** The single-scalar adjacency criterion (correlate final handles) is replaced with a per-layer partial match. Three rules (logical OR) determine adjacency: (1) full structural match on the cross-layer-bound vector, (2) algorithmic isomorphism — identical CFG + identical data wiring regardless of AST, (3) structural isomorphism — identical AST + identical CFG. `PhaseMessage` now carries optional per-layer phase arrays (`ast_phases`, `cfg_phases`, `data_phases`), and `ThdseAgent` emits them from `LayeredProjection`. When per-layer phases are not provided, the consensus falls back to the original single-scalar rule (backward compatible). `ConsensusResult` includes `adjacency_rule_counts` tracking which rules fired, and per-layer centroid phases.
 
@@ -650,7 +652,13 @@ This release addresses three algebraic deficiencies in the swarm consensus, wall
 
 **Upgrade 3 — Weighted Resonance Bundling.** `weighted_bundle_phases` in `arena_ops.py` computes the circular weighted mean: atan2(Σ w_i sin θ_i, Σ w_i cos θ_i). Weights derive from each member's mean resonance with all other clique members, clamped to [0.1, 1.0]. This prevents weakly resonating members from diluting the consensus signal. When all weights are equal, the result is identical to standard `bundle_phases`.
 
-**Tests.** 6 new tests: layered consensus via CFG isomorphism, full-match fallback when no per-layer phases, localized quotient isolation (non-targeted agent unaffected), weighted bundle correctness (dominant weight recovery + equal-weight equivalence), weighted bundle FHRR unit magnitude preservation, adjacency rule count reporting. All 82 tests pass (66 existing + 16 swarm).
+**Fix 1 — Rule-Aware Effective Correlation.** Clique scoring and member weighting previously used `final_corr` for all edges. This geometrically discriminated against algo_iso cliques: if two agents synthesize identical control flow with different syntax, their `final_corr` is near-zero (AST dominates after cross-layer binding), causing them to lose tie-breakers and receive floor weight (0.1). Now, `_effective_corr()` returns the correlation appropriate to the rule that connected each edge: mean(cfg_corr, data_corr) for algo_iso, mean(ast_corr, cfg_corr) for struct_iso, final_corr for full match. Both `clique_score` and member weights use this rule-aware metric.
+
+**Fix 2 — Protocol Bandwidth: uint16 Phase Quantization.** Layer phases (AST, CFG, Data) are now serialized as uint16 instead of float32, mapping [-π, π] to [0, 65535]. This provides ~0.0001 radian precision — orders of magnitude below the FHRR correlation noise floor at d ≥ 64. For d=256 with 3 layers: 1536 bytes (uint16) instead of 3072 bytes (float32), a 50% reduction in layer bandwidth. Final phases remain float32 for decoding precision.
+
+**Fix 3 — Drift Reconciliation (Anti-Tower-of-Babel).** Localized quotient isolation prevents short-term autoimmune collapse but causes long-term topological fragmentation: agents receiving different wall projections develop divergent FHRR coordinate systems until they can no longer communicate. The orchestrator now maintains a `_wall_ledger` tracking all walls and which agents have received them. Every `drift_reconciliation_interval` rounds (default: 5), walls older than `drift_grace_period` rounds (default: 3) are propagated to agents that haven't received them. This balances isolation safety (agents have time to exploit structures along the contradiction axis) against coordinate alignment (eventual convergence to shared quotient space). `SwarmConfig` gains `drift_reconciliation_interval` and `drift_grace_period` parameters. `SwarmRoundResult` gains `walls_reconciled`. `SwarmResult` gains `total_walls_reconciled`.
+
+**Tests.** 12 new tests total (6 from upgrades + 6 from fixes): layered consensus via CFG isomorphism, full-match fallback, localized quotient isolation, weighted bundle correctness, weighted bundle FHRR unit magnitude, adjacency rule counts, algo-iso effective scoring, quantized serialization with layers, quantized serialization with None layers, drift reconciliation timing, drift reconciliation idempotency, wall ledger tracking. All 88 tests pass (66 existing + 22 swarm).
 
 ### v0.6.0 — THDSE-Swarm: Deterministic Multi-Agent Collective Intelligence
 

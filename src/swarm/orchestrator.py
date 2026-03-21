@@ -2,7 +2,7 @@
 
 Manages agent lifecycle, collects candidates, computes algebraic consensus
 via correlate_matrix + Bron-Kerbosch, handles UNSAT broadcasting (Localized
-Quotient Isolation), and tracks swarm-level metrics.
+Quotient Isolation with Drift Reconciliation), and tracks swarm-level metrics.
 
 Each round:
   1. Each agent runs local synthesis -> emits candidate PhaseMessages
@@ -12,15 +12,17 @@ Each round:
   5. If SAT: execute in sandbox -> evaluate fitness
      - If fitness > threshold: broadcast consensus to all agents
   6. If UNSAT: extract actual V_error -> broadcast ONLY to participating agents
-     - Non-participating agents' design spaces remain intact
-  7. Track metrics
-  8. Halt when: max_rounds reached OR stagnation_limit consecutive
+     - Record wall in the global wall ledger for drift reconciliation
+  7. Periodically reconcile drift: propagate aged walls to non-participating
+     agents to prevent topological fragmentation (Tower of Babel effect)
+  8. Track metrics
+  9. Halt when: max_rounds reached OR stagnation_limit consecutive
      rounds with zero progress
 """
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import hdc_core
 
@@ -37,6 +39,19 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class WallLedgerEntry:
+    """A record in the orchestrator's global wall ledger.
+
+    Tracks which agents have received each wall and when the wall was
+    created, enabling delayed propagation for drift reconciliation.
+    """
+    wall_phases: List[float]          # Phase array of V_error
+    round_created: int                # Round index when wall was discovered
+    source_agent_ids: List[int]       # Agents that contributed to the contradiction
+    applied_to: Set[int] = field(default_factory=set)  # Agents that have received this wall
+
+
+@dataclass
 class SwarmRoundResult:
     """Result of a single swarm round."""
     round_index: int
@@ -50,6 +65,7 @@ class SwarmRoundResult:
     walls_broadcast: int
     vocab_growth_per_agent: List[int]
     wall_target_agents: List[int] = field(default_factory=list)
+    walls_reconciled: int = 0
 
 
 @dataclass
@@ -66,6 +82,7 @@ class SwarmResult:
     per_agent_stats: List[Dict[str, Any]] = field(default_factory=list)
     convergence_diagnosis: str = ""
     f_eff_expansion_rate: float = 0.0
+    total_walls_reconciled: int = 0
 
 
 class SwarmOrchestrator:
@@ -117,6 +134,9 @@ class SwarmOrchestrator:
         self._merged_vocab: Optional[SubTreeVocabulary] = None
         self._consensus_decoder: Optional[ConstraintDecoder] = None
 
+        # Global wall ledger for drift reconciliation
+        self._wall_ledger: List[WallLedgerEntry] = []
+
     def _build_merged_vocab(self) -> None:
         """Merge SubTreeVocabulary from ALL agents into the orchestrator's decoder.
 
@@ -162,6 +182,7 @@ class SwarmOrchestrator:
         total_candidates = 0
         total_consensus = 0
         total_walls = 0
+        total_reconciled = 0
         best_fitness = 0.0
         best_source: Optional[str] = None
         consecutive_zero_progress = 0
@@ -249,10 +270,17 @@ class SwarmOrchestrator:
                         )
                         wall_target_agents = consensus.clique_agent_ids
                         self._broadcast_wall_targeted(
-                            actual_v_error, wall_target_agents,
+                            actual_v_error, wall_target_agents, round_idx,
                         )
                         walls_this_round += 1
                         total_walls += 1
+
+            # Drift reconciliation: propagate aged walls to drifting agents
+            walls_reconciled = 0
+            reconciliation_interval = self.config.drift_reconciliation_interval
+            if reconciliation_interval > 0 and (round_idx + 1) % reconciliation_interval == 0:
+                walls_reconciled = self._reconcile_drift(round_idx)
+                total_reconciled += walls_reconciled
 
             # Track vocab growth
             vocab_after = [agent.vocab.size() for agent in self.agents]
@@ -273,6 +301,7 @@ class SwarmOrchestrator:
                 walls_broadcast=walls_this_round,
                 vocab_growth_per_agent=vocab_growth,
                 wall_target_agents=wall_target_agents,
+                walls_reconciled=walls_reconciled,
             )
             round_history.append(round_result)
 
@@ -340,6 +369,7 @@ class SwarmOrchestrator:
             per_agent_stats=per_agent_stats,
             convergence_diagnosis=diagnosis,
             f_eff_expansion_rate=f_eff,
+            total_walls_reconciled=total_reconciled,
         )
 
     def _collect_candidates(self) -> List[PhaseMessage]:
@@ -354,22 +384,35 @@ class SwarmOrchestrator:
         return all_candidates
 
     def _broadcast_wall_targeted(
-        self, wall_phases: List[float], target_agent_ids: List[int],
+        self,
+        wall_phases: List[float],
+        target_agent_ids: List[int],
+        round_index: int = 0,
     ) -> None:
         """Broadcast V_error ONLY to agents that participated in the consensus.
 
-        Agents not in target_agent_ids are not affected. Their design space
-        remains intact. This prevents autoimmune collapse where a local
-        contradiction destroys globally valid structures.
+        Agents not in target_agent_ids are not immediately affected. Their
+        design space remains intact. The wall is recorded in the global
+        ledger for later drift reconciliation.
 
         Args:
             wall_phases: Phase array of the contradiction vector.
             target_agent_ids: Agent IDs from ConsensusResult.clique_agent_ids.
+            round_index: Current round (for drift reconciliation timing).
         """
         targeted = set(target_agent_ids)
         for agent in self.agents:
             if agent.agent_id in targeted:
                 agent.receive_wall_broadcast(wall_phases)
+
+        # Record in wall ledger for drift reconciliation
+        entry = WallLedgerEntry(
+            wall_phases=wall_phases,
+            round_created=round_index,
+            source_agent_ids=list(target_agent_ids),
+            applied_to=set(targeted),
+        )
+        self._wall_ledger.append(entry)
 
     def _broadcast_wall(self, wall_phases: List[float]) -> None:
         """Broadcast V_error to all agents (deprecated).
@@ -380,6 +423,40 @@ class SwarmOrchestrator:
         self._broadcast_wall_targeted(
             wall_phases, [agent.agent_id for agent in self.agents],
         )
+
+    def _reconcile_drift(self, current_round: int) -> int:
+        """Propagate aged walls to agents that haven't received them.
+
+        Only walls older than drift_grace_period are eligible. This gives
+        non-participating agents time to exploit structures along the
+        contradiction axis before the wall is applied.
+
+        The grace period balances two competing concerns:
+          - Too short: equivalent to global broadcast (destroys valid structures)
+          - Too long: coordinate systems drift until agents can't communicate
+
+        Returns the number of wall applications performed.
+        """
+        grace = self.config.drift_grace_period
+        all_agent_ids = {a.agent_id for a in self.agents}
+        agent_map = {a.agent_id: a for a in self.agents}
+        walls_applied = 0
+
+        for entry in self._wall_ledger:
+            # Skip walls that haven't aged past the grace period
+            age = current_round - entry.round_created
+            if age < grace:
+                continue
+
+            # Find agents that haven't received this wall yet
+            missing = all_agent_ids - entry.applied_to
+            for agent_id in sorted(missing):
+                agent = agent_map[agent_id]
+                agent.receive_wall_broadcast(entry.wall_phases)
+                entry.applied_to.add(agent_id)
+                walls_applied += 1
+
+        return walls_applied
 
     def _broadcast_consensus(self, consensus_phases: List[float]) -> None:
         """Broadcast successful consensus to all agents.

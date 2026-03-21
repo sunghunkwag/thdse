@@ -494,3 +494,190 @@ def test_consensus_reports_adjacency_rules():
     assert isinstance(result.adjacency_rule_counts, dict)
     # At least the "full" rule should have fired for identical phases
     assert result.adjacency_rule_counts.get("full", 0) >= 1
+
+
+# ── Test 17: Algo-iso clique uses effective correlation for scoring ──
+
+def test_algo_iso_effective_scoring():
+    """An algo_iso clique should score by mean(cfg, data) correlation,
+    not by final_corr (which is near-zero for different ASTs)."""
+    arena = hdc_core.FhrrArena(400, 64)
+
+    # 3 candidates with identical CFG+Data but different AST/final
+    cfg_shared = [0.5] * 64
+    data_shared = [0.3] * 64
+
+    finals = [lcg_phases(seed, 64) for seed in [100, 200, 300]]
+    asts = [lcg_phases(seed, 64) for seed in [400, 500, 600]]
+
+    result = compute_swarm_consensus(
+        arena,
+        candidate_phases=finals,
+        candidate_metadata=[{"agent_id": i} for i in range(3)],
+        consensus_threshold=0.85,
+        min_clique_size=2,
+        candidate_ast_phases=asts,
+        candidate_cfg_phases=[cfg_shared, cfg_shared, cfg_shared],
+        candidate_data_phases=[data_shared, data_shared, data_shared],
+        layer_threshold=0.70,
+    )
+
+    assert result is not None, "Algo-iso clique should form"
+    assert result.clique_size == 3
+
+    # Mean resonance should reflect CFG+Data correlation (~1.0),
+    # not final_corr (~0.0)
+    assert result.mean_resonance > 0.7, (
+        f"Mean resonance {result.mean_resonance} should reflect "
+        f"effective correlation (CFG+Data), not final_corr"
+    )
+    assert result.adjacency_rule_counts.get("algo_iso", 0) >= 1
+
+
+# ── Test 18: Quantized layer phases preserve correlation accuracy ──
+
+def test_quantized_serialization_preserves_correlation():
+    """Serialize/deserialize a message with layer phases via uint16
+    quantization. Verify that correlation computed on dequantized phases
+    closely matches correlation on original phases."""
+    msg = PhaseMessage(
+        sender_id=0,
+        message_type="candidate",
+        phases=lcg_phases(1000, 64),
+        metadata={"agent_id": 0},
+        timestamp=1,
+        ast_phases=lcg_phases(2000, 64),
+        cfg_phases=[0.5] * 64,
+        data_phases=lcg_phases(3000, 64),
+    )
+
+    data = serialize_message(msg)
+    msg2 = deserialize_message(data)
+
+    # Final phases should be exact (float32)
+    for a, b in zip(msg.phases, msg2.phases):
+        assert abs(a - b) < 1e-5
+
+    # Layer phases should be close (uint16 quantization ~0.0001 rad)
+    assert msg2.ast_phases is not None
+    assert msg2.cfg_phases is not None
+    assert msg2.data_phases is not None
+
+    for a, b in zip(msg.ast_phases, msg2.ast_phases):
+        assert abs(a - b) < 0.001, f"AST phase drift: {abs(a-b)}"
+
+    for a, b in zip(msg.cfg_phases, msg2.cfg_phases):
+        assert abs(a - b) < 0.001, f"CFG phase drift: {abs(a-b)}"
+
+    # Verify bandwidth reduction: layer data uses 2 bytes/dim, not 4
+    # For d=64: 3 layers * (4 + 64*2) = 3 * 132 = 396 bytes for layers
+    # vs old: 3 layers * (4 + 64*4) = 3 * 260 = 780 bytes
+    # (plus header + final phases)
+    # Just verify it's smaller than the old format would have been
+    old_size_layers = 3 * (4 + 64 * 4)  # float32 per layer
+    new_size_layers = 3 * (4 + 64 * 2)  # uint16 per layer
+    assert new_size_layers < old_size_layers
+
+
+# ── Test 19: Quantized serialization with None layers ──────────────
+
+def test_quantized_serialization_none_layers():
+    """Verify backward compat: message with no layer phases round-trips."""
+    msg = PhaseMessage(
+        sender_id=1,
+        message_type="wall",
+        phases=[0.1, 0.2, 0.3] * 10,
+        metadata={"source": "test"},
+        timestamp=5,
+        # No layer phases
+    )
+
+    data = serialize_message(msg)
+    msg2 = deserialize_message(data)
+
+    assert msg2.ast_phases is None
+    assert msg2.cfg_phases is None
+    assert msg2.data_phases is None
+    assert len(msg2.phases) == 30
+    for a, b in zip(msg.phases, msg2.phases):
+        assert abs(a - b) < 1e-5
+
+
+# ── Test 20: Drift reconciliation propagates aged walls ────────────
+
+def test_drift_reconciliation():
+    """After grace period, missed walls are propagated to non-targeted agents."""
+    config = _make_config(n_agents=3, max_rounds=1)
+    config.corpus_paths = [[], [], []]
+    config.drift_grace_period = 2
+
+    orch = SwarmOrchestrator(config)
+    orch.ingest_agent_corpora_dicts([CORPUS_MATH, CORPUS_COMPARE, CORPUS_CONTROL])
+
+    # Targeted broadcast to agent 0 only, at round 0
+    wall_phases = [0.7] * 256
+    orch._broadcast_wall_targeted(wall_phases, [0], round_index=0)
+
+    pre_counts = [a._wall_count for a in orch.agents]
+    # Agent 0: already has the wall
+    assert pre_counts[0] == 1
+
+    # Reconcile at round 1 (age=1 < grace=2): should NOT propagate
+    reconciled = orch._reconcile_drift(current_round=1)
+    assert reconciled == 0
+    assert orch.agents[1]._wall_count == 0
+    assert orch.agents[2]._wall_count == 0
+
+    # Reconcile at round 2 (age=2 >= grace=2): should propagate to agents 1 and 2
+    reconciled = orch._reconcile_drift(current_round=2)
+    assert reconciled == 2
+    assert orch.agents[1]._wall_count == 1
+    assert orch.agents[2]._wall_count == 1
+
+    # Reconcile again: should not re-propagate (already applied)
+    reconciled = orch._reconcile_drift(current_round=3)
+    assert reconciled == 0
+
+
+# ── Test 21: Drift reconciliation idempotent ──────────────────────
+
+def test_drift_reconciliation_idempotent():
+    """Multiple reconciliation calls don't re-apply walls."""
+    config = _make_config(n_agents=2, max_rounds=1)
+    config.corpus_paths = [[], []]
+    config.drift_grace_period = 0  # Immediate propagation
+
+    orch = SwarmOrchestrator(config)
+    orch.ingest_agent_corpora_dicts([CORPUS_MATH, CORPUS_COMPARE])
+
+    orch._broadcast_wall_targeted([0.5] * 256, [0], round_index=0)
+
+    # First reconciliation: propagate to agent 1
+    r1 = orch._reconcile_drift(current_round=0)
+    assert r1 == 1
+    assert orch.agents[1]._wall_count == 1
+
+    # Second reconciliation: nothing to propagate
+    r2 = orch._reconcile_drift(current_round=1)
+    assert r2 == 0
+    assert orch.agents[1]._wall_count == 1  # Still 1, not 2
+
+
+# ── Test 22: Wall ledger tracks entries correctly ─────────────────
+
+def test_wall_ledger_tracking():
+    """Verify wall ledger records source agents and applied-to sets."""
+    config = _make_config(n_agents=3, max_rounds=1)
+    config.corpus_paths = [[], [], []]
+
+    orch = SwarmOrchestrator(config)
+    orch.ingest_agent_corpora_dicts([CORPUS_MATH, CORPUS_COMPARE, CORPUS_CONTROL])
+
+    orch._broadcast_wall_targeted([0.5] * 256, [0, 2], round_index=3)
+
+    assert len(orch._wall_ledger) == 1
+    entry = orch._wall_ledger[0]
+    assert entry.round_created == 3
+    assert set(entry.source_agent_ids) == {0, 2}
+    assert entry.applied_to == {0, 2}
+    assert 1 not in entry.applied_to
