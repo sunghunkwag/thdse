@@ -211,7 +211,7 @@ class SwarmOrchestrator:
             if len(all_candidates) >= 2:
                 # Create temporary arena for consensus
                 tmp_arena = hdc_core.FhrrArena(
-                    len(all_candidates) * 4 + 100, self.config.dimension,
+                    max(len(all_candidates) * 5 + 50, 200), self.config.dimension,
                 )
 
                 candidate_phases = [msg.phases for msg in all_candidates]

@@ -215,9 +215,9 @@ class ThdseAgent:
                 self._timestamp += 1
 
                 # Extract per-layer phases for layered consensus
-                ast_ph = synth_proj.ast_phases if synth_proj.ast_phases else None
-                cfg_ph = synth_proj.cfg_phases if synth_proj.cfg_phases is not None else None
-                data_ph = synth_proj.data_phases if synth_proj.data_phases is not None else None
+                ast_ph = synth_proj.ast_phases if (synth_proj.ast_phases is not None and len(synth_proj.ast_phases) > 0) else None
+                cfg_ph = synth_proj.cfg_phases if (synth_proj.cfg_phases is not None and len(synth_proj.cfg_phases) > 0) else None
+                data_ph = synth_proj.data_phases if (synth_proj.data_phases is not None and len(synth_proj.data_phases) > 0) else None
 
                 candidates.append(PhaseMessage(
                     sender_id=self.agent_id,
