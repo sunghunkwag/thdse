@@ -754,3 +754,104 @@ class AxiomaticSynthesizer:
             sid: self.arena.compute_correlation(synth_handle, self.store.axioms[sid].handle)
             for sid in clique
         }
+
+    # ── SERL Self-Application (Ouroboros SERL) ────────────────────
+
+    def run_serl_self(
+        self,
+        project_root: Optional[str] = None,
+        max_cycles: int = 10,
+        stagnation_limit: int = 3,
+        fitness_threshold: float = 0.4,
+    ) -> Dict[str, Any]:
+        """Run the SERL loop on the engine's own source code.
+
+        This is the ultimate autopoietic test: the engine synthesizes new code
+        from its own modules, executes the synthesized code, and (if it passes
+        fitness) feeds it back into its own vocabulary.
+
+        If this produces new atoms → the engine has modified its own
+        representational capacity. If not → confirmed closed.
+
+        Args:
+            project_root: Project root directory. Auto-detected if None.
+            max_cycles: Maximum SERL cycles.
+            stagnation_limit: Consecutive zero-expansion cycles before halt.
+            fitness_threshold: Minimum fitness for vocabulary expansion.
+
+        Returns:
+            Dictionary with SERL result metrics including f_eff_expansion_rate.
+        """
+        from src.decoder.constraint_decoder import ConstraintDecoder
+        from src.decoder.subtree_vocab import SubTreeVocabulary
+        from src.decoder.vocab_expander import VocabularyExpander
+        from src.execution.sandbox import ExecutionSandbox
+        from src.synthesis.serl import SERLLoop
+
+        if project_root is None:
+            project_root = os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)
+            )))
+
+        # Step 1: Ingest self-source as axioms
+        self_axioms = self.ingest_self(project_root)
+        if len(self_axioms) < 2:
+            return {
+                "error": "Insufficient self-axioms for SERL",
+                "self_axioms": len(self_axioms),
+                "f_eff_expansion_rate": 0.0,
+            }
+
+        # Step 2: Build sub-tree vocabulary from own source
+        vocab = SubTreeVocabulary()
+        src_dir = os.path.join(project_root, "src")
+        for root, _dirs, files in os.walk(src_dir):
+            for fname in files:
+                if fname.endswith(".py"):
+                    vocab.ingest_file(os.path.join(root, fname))
+
+        vocab.project_all(self.arena, self.projector)
+
+        # Step 3: Create decoder and SERL components
+        # Higher activation threshold (0.15) for self-application because
+        # the self-vocab is large (1000+ atoms) and Z3 becomes slow with
+        # too many activated variables. 0.15 selects only strong resonances.
+        decoder = ConstraintDecoder(
+            self.arena, self.projector,
+            self.arena.get_dimension(),
+            activation_threshold=0.15,
+            subtree_vocab=vocab,
+        )
+        sandbox = ExecutionSandbox()
+        expander = VocabularyExpander()
+        loop = SERLLoop()
+
+        # Step 4: Run SERL
+        result = loop.run(
+            self.arena, self.projector, self, decoder,
+            sandbox, expander, vocab,
+            max_cycles=max_cycles,
+            stagnation_limit=stagnation_limit,
+            fitness_threshold=fitness_threshold,
+        )
+
+        return {
+            "self_axioms": len(self_axioms),
+            "cycles_completed": result.cycles_completed,
+            "total_new_atoms": result.total_new_atoms,
+            "vocab_size_initial": result.vocab_size_initial,
+            "vocab_size_final": result.vocab_size_final,
+            "f_eff_expansion_rate": result.f_eff_expansion_rate,
+            "space_closed": result.space_closed,
+            "convergence_diagnosis": result.convergence_diagnosis,
+            "cycle_summary": [
+                {
+                    "cycle": c.cycle_index,
+                    "decoded": c.syntheses_decoded,
+                    "above_fitness": c.syntheses_above_fitness,
+                    "new_atoms": c.new_vocab_atoms,
+                    "best_fitness": c.best_fitness,
+                }
+                for c in result.cycle_history
+            ],
+        }
