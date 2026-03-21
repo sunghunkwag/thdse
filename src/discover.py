@@ -601,6 +601,121 @@ def _run_serl(args, arena, projector, synthesizer, verbose):
         print(f"\n  JSON: {json_path}")
 
 
+def _run_swarm(args, verbose):
+    """Run the THDSE-Swarm multi-agent collective intelligence loop."""
+    from src.swarm.protocol import SwarmConfig
+    from src.swarm.swarm_serl import run_swarm_serl
+    from src.corpus.stdlib_corpus import StdlibCorpus
+
+    n_agents = args.n_agents
+
+    # Build per-agent corpus paths
+    corpus_dirs = list(args.corpus) if args.corpus else []
+
+    if args.stdlib or not corpus_dirs:
+        # Partition stdlib into N non-overlapping segments
+        stdlib_path = StdlibCorpus.find_stdlib_path()
+        if stdlib_path is None:
+            print("ERROR: Could not locate Python standard library")
+            sys.exit(1)
+
+        all_files = StdlibCorpus.list_stdlib_files(stdlib_path, max_files=0)
+        # Group files by their containing directory for partitioning
+        file_paths = sorted(str(f) for f in all_files)
+
+        # Slice into N non-overlapping segments
+        corpus_paths = [[] for _ in range(n_agents)]
+        for i, fpath in enumerate(file_paths):
+            agent_idx = i % n_agents
+            # Use parent directory as corpus path
+            parent = os.path.dirname(fpath)
+            if parent not in corpus_paths[agent_idx]:
+                corpus_paths[agent_idx].append(parent)
+
+        # Deduplicate per agent
+        corpus_paths = [sorted(set(paths)) for paths in corpus_paths]
+
+    elif len(corpus_dirs) >= n_agents:
+        # Distribute directories across agents
+        corpus_paths = [[] for _ in range(n_agents)]
+        for i, d in enumerate(corpus_dirs):
+            corpus_paths[i % n_agents].append(d)
+    else:
+        # Fewer directories than agents: assign each directory to one agent,
+        # remaining agents get no corpus (will ingest nothing)
+        corpus_paths = [[] for _ in range(n_agents)]
+        for i, d in enumerate(corpus_dirs):
+            corpus_paths[i].append(d)
+
+    if verbose:
+        print(f"THDSE-Swarm: {n_agents} agents, d={args.dimension}")
+        for i, paths in enumerate(corpus_paths):
+            print(f"  Agent {i}: {len(paths)} corpus dir(s)")
+
+    config = SwarmConfig(
+        n_agents=n_agents,
+        dimension=args.dimension,
+        arena_capacity=args.capacity,
+        consensus_threshold=args.consensus_threshold,
+        fitness_threshold=0.4,
+        max_rounds=20,
+        stagnation_limit=5,
+        corpus_paths=corpus_paths,
+    )
+
+    if verbose:
+        print("Running swarm SERL loop...")
+
+    result = run_swarm_serl(config, max_rounds=20, stagnation_limit=5)
+
+    # Print human-readable summary
+    print(f"\nSwarm completed: {result.rounds_completed} rounds")
+    print(f"  Agents: {n_agents}")
+    print(f"  Candidates: {result.total_candidates}")
+    print(f"  Consensus rounds: {result.total_consensus_reached}")
+    print(f"  Walls broadcast: {result.total_walls_broadcast}")
+    print(f"  Vocab growth: {result.total_vocab_growth}")
+    print(f"  Best fitness: {result.best_fitness:.2f}")
+    print(f"  F_eff expansion rate: {result.f_eff_expansion_rate:.4f}")
+    print(f"  Diagnosis: {result.convergence_diagnosis}")
+
+    # Write swarm_result.json
+    os.makedirs(args.output, exist_ok=True)
+    json_path = os.path.join(args.output, "swarm_result.json")
+    result_dict = {
+        "n_agents": n_agents,
+        "dimension": args.dimension,
+        "rounds_completed": result.rounds_completed,
+        "total_candidates": result.total_candidates,
+        "total_consensus_reached": result.total_consensus_reached,
+        "total_walls_broadcast": result.total_walls_broadcast,
+        "total_vocab_growth": result.total_vocab_growth,
+        "best_fitness": result.best_fitness,
+        "best_source": result.best_source,
+        "f_eff_expansion_rate": result.f_eff_expansion_rate,
+        "convergence_diagnosis": result.convergence_diagnosis,
+        "per_agent_stats": result.per_agent_stats,
+        "round_history": [
+            {
+                "round": r.round_index,
+                "candidates": r.candidates_collected,
+                "consensus": r.consensus_reached,
+                "clique_size": r.consensus_clique_size,
+                "fitness": r.fitness,
+                "walls_broadcast": r.walls_broadcast,
+                "vocab_growth": r.vocab_growth_per_agent,
+            }
+            for r in result.round_history
+        ],
+    }
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(result_dict, f, indent=2)
+
+    if verbose:
+        print(f"\n  JSON: {json_path}")
+
+
 def main() -> None:
     """Run the structural discovery pipeline."""
     parser = argparse.ArgumentParser(
@@ -609,9 +724,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["analysis", "diff", "refactor", "synthesis", "self-diagnostic", "cartography", "serl"],
+        choices=["analysis", "diff", "refactor", "synthesis", "self-diagnostic", "cartography", "serl", "swarm"],
         default="analysis",
-        help="Pipeline mode: analysis (default), diff, refactor, synthesis, self-diagnostic, cartography, serl.",
+        help="Pipeline mode: analysis (default), diff, refactor, synthesis, self-diagnostic, cartography, serl, swarm.",
     )
     parser.add_argument(
         "--corpus",
@@ -671,6 +786,20 @@ def main() -> None:
         help="File paths for --mode diff (exactly 2 required).",
     )
 
+    # Swarm-specific arguments
+    parser.add_argument(
+        "--n-agents",
+        type=int,
+        default=3,
+        help="Number of swarm agents (default: 3, for --mode swarm).",
+    )
+    parser.add_argument(
+        "--consensus-threshold",
+        type=float,
+        default=0.85,
+        help="Resonance threshold for swarm consensus (default: 0.85).",
+    )
+
     args = parser.parse_args()
 
     mode = args.mode
@@ -682,11 +811,25 @@ def main() -> None:
             parser.error("--mode diff requires exactly 2 file paths as positional arguments")
     elif mode == "self-diagnostic":
         pass  # No corpus required
+    elif mode == "swarm":
+        # Swarm mode uses --stdlib by default if no --corpus provided
+        if not args.corpus and not args.stdlib:
+            args.stdlib = True
     elif mode in ("analysis", "refactor", "synthesis", "cartography", "serl"):
         if not args.corpus and not args.stdlib and not args.load:
             parser.error("Specify --corpus, --stdlib, or --load")
 
     t_start = time.time()
+
+    # Swarm mode manages its own pipeline — skip shared init
+    if mode == "swarm":
+        if verbose:
+            print(f"Initializing swarm mode (d={args.dimension})")
+        _run_swarm(args, verbose)
+        t_end = time.time()
+        if verbose:
+            print(f"\nDone in {t_end - t_start:.1f}s")
+        return
 
     # Initialize pipeline
     arena, projector, synthesizer, hdc_core = _init_pipeline(args)
