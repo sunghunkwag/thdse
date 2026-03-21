@@ -325,3 +325,172 @@ def test_swarm_serl_entry_point():
     assert result.rounds_completed > 0
     assert isinstance(result.convergence_diagnosis, str)
     assert isinstance(result.f_eff_expansion_rate, float)
+
+
+# ── Helpers for new tests ─────────────────────────────────────────
+
+def lcg_phases(seed, dim):
+    """Deterministic phase array generation via LCG."""
+    state = seed & 0xFFFFFFFF
+    phases = []
+    for _ in range(dim):
+        state = (state * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFFFFFF
+        phase = ((state >> 33) / (2**31)) * 2.0 * math.pi - math.pi
+        phases.append(phase)
+    return phases
+
+
+# ── Test 11: Layered partial consensus — CFG isomorphism ─────────
+
+def test_layered_consensus_cfg_isomorphism():
+    """Two candidates with different AST but identical CFG phases
+    should form a clique via algorithmic isomorphism rule."""
+    arena = hdc_core.FhrrArena(200, 64)
+
+    # Generate AST phases that are DIFFERENT
+    ast_a = lcg_phases(100, 64)
+    ast_b = lcg_phases(200, 64)
+
+    # Generate CFG and Data phases that are IDENTICAL
+    cfg_shared = [0.5] * 64
+    data_shared = [0.3] * 64
+
+    # Final phases are different (because AST differs)
+    final_a = lcg_phases(300, 64)
+    final_b = lcg_phases(400, 64)
+
+    result = compute_swarm_consensus(
+        arena,
+        candidate_phases=[final_a, final_b],
+        candidate_metadata=[{"agent_id": 0}, {"agent_id": 1}],
+        consensus_threshold=0.85,
+        min_clique_size=2,
+        candidate_ast_phases=[ast_a, ast_b],
+        candidate_cfg_phases=[cfg_shared, cfg_shared],
+        candidate_data_phases=[data_shared, data_shared],
+        layer_threshold=0.70,
+    )
+
+    # Should form consensus via CFG+Data isomorphism even though
+    # final correlation is low
+    assert result is not None, (
+        "Identical CFG+Data should trigger algorithmic isomorphism consensus"
+    )
+
+
+# ── Test 12: Layered consensus falls back to full match ──────────
+
+def test_layered_consensus_full_match_still_works():
+    """High final-handle correlation still triggers consensus
+    even when per-layer phases are not provided."""
+    arena = hdc_core.FhrrArena(200, 64)
+    phases = [0.5] * 64
+
+    result = compute_swarm_consensus(
+        arena,
+        candidate_phases=[phases, phases, phases],
+        candidate_metadata=[{"agent_id": i} for i in range(3)],
+        consensus_threshold=0.85,
+        min_clique_size=2,
+        # No per-layer phases provided
+        candidate_ast_phases=None,
+        candidate_cfg_phases=None,
+        candidate_data_phases=None,
+    )
+
+    assert result is not None
+    assert result.clique_size == 3
+
+
+# ── Test 13: Localized quotient isolation ────────────────────────
+
+def test_localized_quotient_isolation():
+    """V_error broadcast targets only participating agents.
+    Non-participating agent's wall count should NOT increase."""
+    config = _make_config(n_agents=3, max_rounds=1)
+    config.corpus_paths = [[], [], []]
+
+    orch = SwarmOrchestrator(config)
+    orch.ingest_agent_corpora_dicts([CORPUS_MATH, CORPUS_COMPARE, CORPUS_CONTROL])
+
+    # Record pre-broadcast wall counts
+    pre_counts = [a._wall_count for a in orch.agents]
+
+    # Targeted broadcast to agents 0 and 2 only
+    wall_phases = [0.7] * 256
+    orch._broadcast_wall_targeted(wall_phases, [0, 2])
+
+    # Agent 0: should increase
+    assert orch.agents[0]._wall_count == pre_counts[0] + 1
+    # Agent 1: should NOT increase (not targeted)
+    assert orch.agents[1]._wall_count == pre_counts[1]
+    # Agent 2: should increase
+    assert orch.agents[2]._wall_count == pre_counts[2] + 1
+
+
+# ── Test 14: Weighted bundling correctness ───────────────────────
+
+def test_weighted_bundle_phases():
+    """Weighted bundle with [1.0, 0.0] should return first vector's phases."""
+    from src.utils.arena_ops import weighted_bundle_phases
+
+    p_a = [0.0, 1.0, -1.0, 0.5]
+    p_b = [3.14, -3.14, 0.0, 2.0]
+
+    # Weight 1.0 for A, near-zero for B -> result ~= A
+    result = weighted_bundle_phases([p_a, p_b], [1.0, 0.001])
+    for i in range(4):
+        assert abs(result[i] - p_a[i]) < 0.05, (
+            f"Dim {i}: expected ~= {p_a[i]}, got {result[i]}"
+        )
+
+    # Equal weights -> same as standard bundle
+    from src.utils.arena_ops import bundle_phases
+    equal = weighted_bundle_phases([p_a, p_b], [1.0, 1.0])
+    standard = bundle_phases([p_a, p_b])
+    for i in range(4):
+        assert abs(equal[i] - standard[i]) < 1e-6, (
+            f"Equal weights should match standard bundle at dim {i}"
+        )
+
+
+# ── Test 15: Weighted bundling preserves FHRR unit magnitude ────
+
+def test_weighted_bundle_unit_magnitude():
+    """Weighted bundle output, when injected into arena, should
+    have self-correlation ~= 1.0 (unit magnitude invariant)."""
+    from src.utils.arena_ops import weighted_bundle_phases
+
+    phases = [[0.1 * i for i in range(64)],
+              [0.2 * i for i in range(64)],
+              [0.3 * i for i in range(64)]]
+    weights = [0.9, 0.5, 0.1]
+
+    centroid = weighted_bundle_phases(phases, weights)
+    arena = hdc_core.FhrrArena(10, 64)
+    h = arena.allocate()
+    arena.inject_phases(h, centroid)
+    self_corr = arena.compute_correlation(h, h)
+    assert self_corr > 0.99, f"Self-correlation {self_corr} should be ~= 1.0"
+
+
+# ── Test 16: ConsensusResult includes adjacency rule counts ──────
+
+def test_consensus_reports_adjacency_rules():
+    """ConsensusResult.adjacency_rule_counts should report which rules fired."""
+    arena = hdc_core.FhrrArena(200, 64)
+    phases = [0.5] * 64
+
+    result = compute_swarm_consensus(
+        arena,
+        candidate_phases=[phases, phases],
+        candidate_metadata=[{"agent_id": 0}, {"agent_id": 1}],
+        consensus_threshold=0.85,
+        min_clique_size=2,
+    )
+
+    assert result is not None
+    assert hasattr(result, 'adjacency_rule_counts')
+    assert isinstance(result.adjacency_rule_counts, dict)
+    # At least the "full" rule should have fired for identical phases
+    assert result.adjacency_rule_counts.get("full", 0) >= 1

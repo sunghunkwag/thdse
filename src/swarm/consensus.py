@@ -1,24 +1,44 @@
 """Resonance Clique Consensus — Algebraic consensus from candidate phase arrays.
 
 Given N candidate vectors from M agents, find the subset that mutually resonate
-above threshold, bundled into a centroid. Uses correlate_matrix (single FFI call)
-and Bron-Kerbosch clique extraction.
+above threshold, bundled into a weighted centroid. Uses correlate_matrix (single
+FFI call per layer) and Bron-Kerbosch clique extraction.
+
+Adjacency rules (logical OR):
+  1. Full structural match: correlate(final_i, final_j) > consensus_threshold
+  2. Algorithmic isomorphism: correlate(cfg_i, cfg_j) > layer_threshold AND
+     correlate(data_i, data_j) > layer_threshold
+  3. Structural isomorphism: correlate(ast_i, ast_j) > layer_threshold AND
+     correlate(cfg_i, cfg_j) > layer_threshold
+
+Bundling uses weighted resonance: high-resonance members contribute more
+to the centroid than low-resonance members.
 
 No voting. No debate. Pure algebraic composition.
 """
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from src.utils.arena_ops import weighted_bundle_phases
 
 
 @dataclass
 class ConsensusResult:
     """Result of swarm consensus computation."""
-    centroid_phases: List[float]          # Bundled centroid of winning clique
+    centroid_phases: List[float]          # Weighted centroid of winning clique
     clique_member_indices: List[int]      # Which candidates are in the clique
     clique_agent_ids: List[int]           # Which agents contributed
     mean_resonance: float                 # Mean pairwise rho within clique
     clique_size: int                      # Number of members
+    # Which adjacency rule triggered each edge
+    adjacency_rule_counts: Dict[str, int] = field(
+        default_factory=lambda: {"full": 0, "algo_iso": 0, "struct_iso": 0}
+    )
+    # Per-layer centroid phases
+    centroid_ast_phases: Optional[List[float]] = None
+    centroid_cfg_phases: Optional[List[float]] = None
+    centroid_data_phases: Optional[List[float]] = None
 
 
 def _bron_kerbosch(
@@ -43,31 +63,87 @@ def _bron_kerbosch(
         X = X | {v}
 
 
+def _inject_and_correlate(
+    arena: Any,
+    phase_arrays: List[Optional[List[float]]],
+) -> Tuple[Dict[tuple, float], List[Optional[int]]]:
+    """Inject phase arrays into arena and compute the correlation matrix.
+
+    Returns (corr_matrix, handles). Entries with None phases are skipped
+    and will have None handles.
+    """
+    n = len(phase_arrays)
+    handles: List[Optional[int]] = [None] * n
+    valid_indices = []
+
+    for i, phases in enumerate(phase_arrays):
+        if phases is not None:
+            h = arena.allocate()
+            arena.inject_phases(h, phases)
+            handles[i] = h
+            valid_indices.append(i)
+
+    corr_matrix: Dict[tuple, float] = {}
+
+    if len(valid_indices) >= 2:
+        valid_handles = [handles[i] for i in valid_indices]
+        flat = arena.correlate_matrix(valid_handles)
+
+        k = 0
+        for ii in range(len(valid_indices)):
+            idx_i = valid_indices[ii]
+            corr_matrix[(idx_i, idx_i)] = arena.compute_correlation(
+                handles[idx_i], handles[idx_i],
+            )
+            for jj in range(ii + 1, len(valid_indices)):
+                idx_j = valid_indices[jj]
+                corr = flat[k]
+                k += 1
+                corr_matrix[(idx_i, idx_j)] = corr
+                corr_matrix[(idx_j, idx_i)] = corr
+    elif len(valid_indices) == 1:
+        idx = valid_indices[0]
+        corr_matrix[(idx, idx)] = arena.compute_correlation(
+            handles[idx], handles[idx],
+        )
+
+    return corr_matrix, handles
+
+
 def compute_swarm_consensus(
     arena: Any,
     candidate_phases: List[List[float]],
     candidate_metadata: List[Dict[str, Any]],
     consensus_threshold: float = 0.85,
     min_clique_size: int = 2,
+    # Layered consensus parameters
+    candidate_ast_phases: Optional[List[Optional[List[float]]]] = None,
+    candidate_cfg_phases: Optional[List[Optional[List[float]]]] = None,
+    candidate_data_phases: Optional[List[Optional[List[float]]]] = None,
+    layer_threshold: float = 0.70,
 ) -> Optional[ConsensusResult]:
     """Compute the algebraic consensus from candidate phase arrays.
 
     Algorithm:
       1. Inject all candidate phases into a temporary arena
-      2. Call arena.correlate_matrix() -- single FFI call for NxN matrix
-      3. Build adjacency graph where edge exists iff rho > consensus_threshold
+      2. Call arena.correlate_matrix() per layer (up to 4 calls: final + 3 layers)
+      3. Build adjacency graph using layered partial match rules (logical OR)
       4. Run Bron-Kerbosch to find maximal cliques
       5. Select the largest clique (ties broken by mean resonance)
-      6. Bundle all clique members into centroid vector
-      7. Return centroid phases + clique membership
+      6. Weighted bundle clique members into centroid
+      7. Return centroid phases + clique membership + rule statistics
 
     Args:
         arena: A temporary FhrrArena for consensus computation.
                (NOT any agent's arena -- create a fresh one)
-        candidate_phases: List of phase arrays from all agents.
+        candidate_phases: List of final-handle phase arrays from all agents.
         candidate_metadata: Parallel list of metadata dicts.
-        consensus_threshold: Minimum rho for clique adjacency.
+        consensus_threshold: Minimum rho for full-match adjacency.
         min_clique_size: Minimum clique size for valid consensus.
+        candidate_ast_phases: Optional per-candidate AST layer phases.
+        candidate_cfg_phases: Optional per-candidate CFG layer phases.
+        candidate_data_phases: Optional per-candidate Data layer phases.
+        layer_threshold: Minimum rho for per-layer adjacency rules.
 
     Returns:
         ConsensusResult or None if no clique meets the threshold.
@@ -76,37 +152,80 @@ def compute_swarm_consensus(
     if n < min_clique_size:
         return None
 
-    # Step 1: Inject all candidates into the temporary arena
-    handles = []
-    for phases in candidate_phases:
-        h = arena.allocate()
-        arena.inject_phases(h, phases)
-        handles.append(h)
+    # Step 1: Compute final-handle correlation matrix
+    final_corr, final_handles = _inject_and_correlate(arena, candidate_phases)
 
-    # Step 2: Compute NxN correlation matrix via single FFI call
-    # correlate_matrix returns flat upper triangle: [(0,1), (0,2), ..., (n-2,n-1)]
-    if n >= 2:
-        flat = arena.correlate_matrix(handles)
-    else:
-        flat = []
+    # Step 2: Compute per-layer correlation matrices (if provided)
+    ast_corr: Dict[tuple, float] = {}
+    cfg_corr: Dict[tuple, float] = {}
+    data_corr: Dict[tuple, float] = {}
 
-    # Unpack into full matrix
-    corr_matrix: Dict[tuple, float] = {}
-    k = 0
-    for i in range(n):
-        corr_matrix[(i, i)] = arena.compute_correlation(handles[i], handles[i])
-        for j in range(i + 1, n):
-            corr = flat[k]
-            k += 1
-            corr_matrix[(i, j)] = corr
-            corr_matrix[(j, i)] = corr
+    has_layers = (
+        candidate_ast_phases is not None
+        or candidate_cfg_phases is not None
+        or candidate_data_phases is not None
+    )
 
-    # Step 3: Build adjacency graph
+    if candidate_ast_phases is not None:
+        ast_corr, _ = _inject_and_correlate(arena, candidate_ast_phases)
+    if candidate_cfg_phases is not None:
+        cfg_corr, _ = _inject_and_correlate(arena, candidate_cfg_phases)
+    if candidate_data_phases is not None:
+        data_corr, _ = _inject_and_correlate(arena, candidate_data_phases)
+
+    # Step 3: Build adjacency graph with layered partial match
     adj: Dict[int, Set[int]] = {i: set() for i in range(n)}
+    rule_counts = {"full": 0, "algo_iso": 0, "struct_iso": 0}
+
     for i in range(n):
-        for j in range(n):
-            if i != j and corr_matrix.get((i, j), 0.0) > consensus_threshold:
+        for j in range(i + 1, n):
+            matched = False
+
+            # Rule 1: Full structural match
+            final_rho = final_corr.get((i, j), 0.0)
+            if final_rho > consensus_threshold:
+                rule_counts["full"] += 1
+                matched = True
+
+            # Rule 2: Algorithmic isomorphism (CFG + Data)
+            if not matched and has_layers:
+                cfg_ok = (
+                    candidate_cfg_phases is not None
+                    and candidate_cfg_phases[i] is not None
+                    and candidate_cfg_phases[j] is not None
+                    and cfg_corr.get((i, j), 0.0) > layer_threshold
+                )
+                data_ok = (
+                    candidate_data_phases is not None
+                    and candidate_data_phases[i] is not None
+                    and candidate_data_phases[j] is not None
+                    and data_corr.get((i, j), 0.0) > layer_threshold
+                )
+                if cfg_ok and data_ok:
+                    rule_counts["algo_iso"] += 1
+                    matched = True
+
+            # Rule 3: Structural isomorphism (AST + CFG)
+            if not matched and has_layers:
+                ast_ok = (
+                    candidate_ast_phases is not None
+                    and candidate_ast_phases[i] is not None
+                    and candidate_ast_phases[j] is not None
+                    and ast_corr.get((i, j), 0.0) > layer_threshold
+                )
+                cfg_ok2 = (
+                    candidate_cfg_phases is not None
+                    and candidate_cfg_phases[i] is not None
+                    and candidate_cfg_phases[j] is not None
+                    and cfg_corr.get((i, j), 0.0) > layer_threshold
+                )
+                if ast_ok and cfg_ok2:
+                    rule_counts["struct_iso"] += 1
+                    matched = True
+
+            if matched:
                 adj[i].add(j)
+                adj[j].add(i)
 
     # Step 4: Bron-Kerbosch clique extraction
     cliques: List[List[int]] = []
@@ -119,19 +238,75 @@ def compute_swarm_consensus(
 
     # Step 5: Select best clique (largest, then highest mean resonance)
     def clique_score(clique: List[int]) -> tuple:
-        pairs = [(clique[i], clique[j])
-                 for i in range(len(clique)) for j in range(i + 1, len(clique))]
-        mean_res = sum(corr_matrix[(a, b)] for a, b in pairs) / max(len(pairs), 1)
+        pairs = [(clique[a], clique[b])
+                 for a in range(len(clique)) for b in range(a + 1, len(clique))]
+        mean_res = sum(final_corr.get((x, y), 0.0) for x, y in pairs) / max(len(pairs), 1)
         return (len(clique), mean_res)
 
     best_clique = max(valid_cliques, key=clique_score)
     _, mean_resonance = clique_score(best_clique)
 
-    # Step 6: Bundle clique members into centroid
-    clique_handles = [handles[i] for i in best_clique]
+    # Step 6: Weighted bundle based on pairwise resonance within clique
+    member_weights = []
+    for idx in best_clique:
+        others = [j for j in best_clique if j != idx]
+        if others:
+            mean_res = sum(
+                final_corr.get((idx, j), 0.0) for j in others
+            ) / len(others)
+        else:
+            mean_res = 1.0
+        # Clamp to [0.1, 1.0] to prevent zero-weight members
+        member_weights.append(max(0.1, mean_res))
+
+    # Weighted bundle in phase domain
+    clique_phase_arrays = [candidate_phases[i] for i in best_clique]
+    centroid_phases = weighted_bundle_phases(clique_phase_arrays, member_weights)
+
+    # Inject result into arena for downstream use
     centroid_h = arena.allocate()
-    arena.bundle(clique_handles, centroid_h)
-    centroid_phases = list(arena.extract_phases(centroid_h))
+    arena.inject_phases(centroid_h, centroid_phases)
+
+    # Per-layer weighted centroids
+    centroid_ast_phases = None
+    centroid_cfg_phases = None
+    centroid_data_phases = None
+
+    if candidate_ast_phases is not None:
+        ast_arrays = [
+            candidate_ast_phases[i] for i in best_clique
+            if candidate_ast_phases[i] is not None
+        ]
+        ast_wts = [
+            member_weights[k] for k, i in enumerate(best_clique)
+            if candidate_ast_phases[i] is not None
+        ]
+        if ast_arrays:
+            centroid_ast_phases = weighted_bundle_phases(ast_arrays, ast_wts)
+
+    if candidate_cfg_phases is not None:
+        cfg_arrays = [
+            candidate_cfg_phases[i] for i in best_clique
+            if candidate_cfg_phases[i] is not None
+        ]
+        cfg_wts = [
+            member_weights[k] for k, i in enumerate(best_clique)
+            if candidate_cfg_phases[i] is not None
+        ]
+        if cfg_arrays:
+            centroid_cfg_phases = weighted_bundle_phases(cfg_arrays, cfg_wts)
+
+    if candidate_data_phases is not None:
+        data_arrays = [
+            candidate_data_phases[i] for i in best_clique
+            if candidate_data_phases[i] is not None
+        ]
+        data_wts = [
+            member_weights[k] for k, i in enumerate(best_clique)
+            if candidate_data_phases[i] is not None
+        ]
+        if data_arrays:
+            centroid_data_phases = weighted_bundle_phases(data_arrays, data_wts)
 
     # Extract agent IDs from metadata
     clique_agent_ids = []
@@ -148,4 +323,8 @@ def compute_swarm_consensus(
         clique_agent_ids=clique_agent_ids,
         mean_resonance=mean_resonance,
         clique_size=len(best_clique),
+        adjacency_rule_counts=rule_counts,
+        centroid_ast_phases=centroid_ast_phases,
+        centroid_cfg_phases=centroid_cfg_phases,
+        centroid_data_phases=centroid_data_phases,
     )

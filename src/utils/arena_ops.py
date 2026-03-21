@@ -100,6 +100,48 @@ def expand_phases(phases: List[float], new_dim: int) -> List[float]:
 
 # ── Topological Thermodynamics: Entropy Computation ──────────────
 
+def weighted_bundle_phases(
+    phase_arrays: List[List[float]],
+    weights: List[float],
+) -> List[float]:
+    """Weighted bundle: each member's contribution is scaled by its weight.
+
+    In FHRR, weighting is applied to the complex components before summation:
+      centroid[d] = atan2(
+          Σ_i w_i * sin(θ_i[d]),
+          Σ_i w_i * cos(θ_i[d])
+      )
+
+    This is the correct algebraic generalization of bundle (⊕) to non-uniform
+    superposition. When all weights are equal, this reduces to standard bundle.
+
+    Higher-weight members pull the centroid phase angle toward their direction
+    more strongly. After normalization, each component returns to unit magnitude
+    (preserving the FHRR invariant), but the ANGLE is biased toward
+    high-resonance members.
+
+    Args:
+        phase_arrays: List of phase vectors to bundle.
+        weights: Parallel list of non-negative weights (one per vector).
+                 Need not sum to 1 — only relative magnitudes matter.
+
+    Returns:
+        Weighted centroid phase array.
+    """
+    if not phase_arrays:
+        return []
+    if len(phase_arrays) != len(weights):
+        raise ValueError("phase_arrays and weights must have equal length")
+    dim = len(phase_arrays[0])
+    cos_sum = np.zeros(dim)
+    sin_sum = np.zeros(dim)
+    for phases, w in zip(phase_arrays, weights):
+        arr = np.asarray(phases)
+        cos_sum += w * np.cos(arr)
+        sin_sum += w * np.sin(arr)
+    return np.arctan2(sin_sum, cos_sum).tolist()
+
+
 def compute_phase_entropy(phases: List[float]) -> float:
     """Compute the structural entropy of a phase vector.
 
