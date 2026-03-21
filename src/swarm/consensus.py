@@ -11,8 +11,11 @@ Adjacency rules (logical OR):
   3. Structural isomorphism: correlate(ast_i, ast_j) > layer_threshold AND
      correlate(cfg_i, cfg_j) > layer_threshold
 
-Bundling uses weighted resonance: high-resonance members contribute more
-to the centroid than low-resonance members.
+Clique scoring and member weighting use rule-aware effective correlation:
+edges formed via algo_iso use mean(cfg_corr, data_corr), edges formed via
+struct_iso use mean(ast_corr, cfg_corr), and edges formed via full match
+use final_corr. This prevents geometric discrimination against cliques
+formed through partial-layer consensus.
 
 No voting. No debate. Pure algebraic composition.
 """
@@ -29,7 +32,7 @@ class ConsensusResult:
     centroid_phases: List[float]          # Weighted centroid of winning clique
     clique_member_indices: List[int]      # Which candidates are in the clique
     clique_agent_ids: List[int]           # Which agents contributed
-    mean_resonance: float                 # Mean pairwise rho within clique
+    mean_resonance: float                 # Mean pairwise effective rho within clique
     clique_size: int                      # Number of members
     # Which adjacency rule triggered each edge
     adjacency_rule_counts: Dict[str, int] = field(
@@ -110,6 +113,39 @@ def _inject_and_correlate(
     return corr_matrix, handles
 
 
+def _effective_corr(
+    i: int, j: int,
+    edge_rules: Dict[Tuple[int, int], str],
+    final_corr: Dict[tuple, float],
+    cfg_corr: Dict[tuple, float],
+    data_corr: Dict[tuple, float],
+    ast_corr: Dict[tuple, float],
+) -> float:
+    """Compute the effective correlation for a pair based on the adjacency rule.
+
+    For full match: use final_corr (cross-layer bound vector).
+    For algo_iso: use mean(cfg_corr, data_corr) — the layers that matched.
+    For struct_iso: use mean(ast_corr, cfg_corr) — the layers that matched.
+
+    This prevents geometric discrimination: an algo_iso clique with strong
+    CFG+Data correlation is scored by its actual strength, not penalized
+    by its inherently low final_corr (which is dominated by the differing AST).
+    """
+    key = (min(i, j), max(i, j))
+    rule = edge_rules.get(key, "full")
+
+    if rule == "algo_iso":
+        c = cfg_corr.get((i, j), 0.0)
+        d = data_corr.get((i, j), 0.0)
+        return (c + d) / 2.0
+    elif rule == "struct_iso":
+        a = ast_corr.get((i, j), 0.0)
+        c = cfg_corr.get((i, j), 0.0)
+        return (a + c) / 2.0
+    else:
+        return final_corr.get((i, j), 0.0)
+
+
 def compute_swarm_consensus(
     arena: Any,
     candidate_phases: List[List[float]],
@@ -129,8 +165,8 @@ def compute_swarm_consensus(
       2. Call arena.correlate_matrix() per layer (up to 4 calls: final + 3 layers)
       3. Build adjacency graph using layered partial match rules (logical OR)
       4. Run Bron-Kerbosch to find maximal cliques
-      5. Select the largest clique (ties broken by mean resonance)
-      6. Weighted bundle clique members into centroid
+      5. Select the largest clique (ties broken by mean effective resonance)
+      6. Weighted bundle clique members into centroid (rule-aware weights)
       7. Return centroid phases + clique membership + rule statistics
 
     Args:
@@ -176,6 +212,8 @@ def compute_swarm_consensus(
     # Step 3: Build adjacency graph with layered partial match
     adj: Dict[int, Set[int]] = {i: set() for i in range(n)}
     rule_counts = {"full": 0, "algo_iso": 0, "struct_iso": 0}
+    # Track which rule connected each edge (canonical key: min, max)
+    edge_rules: Dict[Tuple[int, int], str] = {}
 
     for i in range(n):
         for j in range(i + 1, n):
@@ -185,6 +223,7 @@ def compute_swarm_consensus(
             final_rho = final_corr.get((i, j), 0.0)
             if final_rho > consensus_threshold:
                 rule_counts["full"] += 1
+                edge_rules[(i, j)] = "full"
                 matched = True
 
             # Rule 2: Algorithmic isomorphism (CFG + Data)
@@ -203,6 +242,7 @@ def compute_swarm_consensus(
                 )
                 if cfg_ok and data_ok:
                     rule_counts["algo_iso"] += 1
+                    edge_rules[(i, j)] = "algo_iso"
                     matched = True
 
             # Rule 3: Structural isomorphism (AST + CFG)
@@ -221,6 +261,7 @@ def compute_swarm_consensus(
                 )
                 if ast_ok and cfg_ok2:
                     rule_counts["struct_iso"] += 1
+                    edge_rules[(i, j)] = "struct_iso"
                     matched = True
 
             if matched:
@@ -236,28 +277,32 @@ def compute_swarm_consensus(
     if not valid_cliques:
         return None
 
-    # Step 5: Select best clique (largest, then highest mean resonance)
+    # Step 5: Select best clique using rule-aware effective correlation
     def clique_score(clique: List[int]) -> tuple:
         pairs = [(clique[a], clique[b])
                  for a in range(len(clique)) for b in range(a + 1, len(clique))]
-        mean_res = sum(final_corr.get((x, y), 0.0) for x, y in pairs) / max(len(pairs), 1)
-        return (len(clique), mean_res)
+        mean_eff = sum(
+            _effective_corr(x, y, edge_rules, final_corr, cfg_corr, data_corr, ast_corr)
+            for x, y in pairs
+        ) / max(len(pairs), 1)
+        return (len(clique), mean_eff)
 
     best_clique = max(valid_cliques, key=clique_score)
     _, mean_resonance = clique_score(best_clique)
 
-    # Step 6: Weighted bundle based on pairwise resonance within clique
+    # Step 6: Weighted bundle using rule-aware effective correlation
     member_weights = []
     for idx in best_clique:
         others = [j for j in best_clique if j != idx]
         if others:
-            mean_res = sum(
-                final_corr.get((idx, j), 0.0) for j in others
+            mean_eff = sum(
+                _effective_corr(idx, j, edge_rules, final_corr, cfg_corr, data_corr, ast_corr)
+                for j in others
             ) / len(others)
         else:
-            mean_res = 1.0
+            mean_eff = 1.0
         # Clamp to [0.1, 1.0] to prevent zero-weight members
-        member_weights.append(max(0.1, mean_res))
+        member_weights.append(max(0.1, mean_eff))
 
     # Weighted bundle in phase domain
     clique_phase_arrays = [candidate_phases[i] for i in best_clique]

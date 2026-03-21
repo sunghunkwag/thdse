@@ -4,12 +4,21 @@ inter-agent communication via raw FHRR phase arrays.
 No text. No parsing. Only phase arrays (List[float]) and minimal metadata.
 The JSON header is metadata only; the float payload uses struct.pack for
 exact precision preservation.
+
+Layer phases (AST, CFG, Data) use uint16 quantization to reduce bandwidth:
+  phase in [-pi, pi] -> uint16 in [0, 65535]
+  Precision: ~0.0001 radians (~0.006 degrees), sufficient for correlation.
+  Bandwidth: 2 bytes/dim vs 4 bytes/dim = 50% reduction per layer.
+  Final phases remain float32 (full precision for decoding).
 """
 
 import json
+import math
 import struct
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+_TWO_PI = 2.0 * math.pi
 
 
 @dataclass
@@ -40,26 +49,44 @@ class SwarmConfig:
     # corpus_paths[i] = list of directories for agent i
     # MUST have len(corpus_paths) == n_agents
     # Each agent's corpus MUST be different
+    drift_reconciliation_interval: int = 5  # Rounds between drift reconciliation
+    drift_grace_period: int = 3             # Rounds before a wall is eligible for propagation
+
+
+# ── Phase Quantization ───────────────────────────────────────────
+
+def _quantize_phases(phases: List[float]) -> List[int]:
+    """Quantize phases from [-pi, pi] to uint16 [0, 65535].
+
+    Precision: ~0.0001 radians per quantum.
+    For d=256: 512 bytes instead of 1024 bytes (50% reduction).
+    """
+    return [int(((p + math.pi) / _TWO_PI) * 65535 + 0.5) & 0xFFFF for p in phases]
+
+
+def _dequantize_phases(quants: List[int]) -> List[float]:
+    """Dequantize uint16 [0, 65535] back to phases in [-pi, pi]."""
+    return [(q / 65535.0) * _TWO_PI - math.pi for q in quants]
 
 
 # ── Serialization ────────────────────────────────────────────────
 
 # Wire format:
 #   [4B header_len][header JSON]
-#   [4B ast_len][ast float32s]
-#   [4B cfg_len][cfg float32s]
-#   [4B data_len][data float32s]
-#   [remaining: final float32s]
+#   [4B ast_len][ast uint16s]     <- quantized (2 bytes per phase)
+#   [4B cfg_len][cfg uint16s]     <- quantized
+#   [4B data_len][data uint16s]   <- quantized
+#   [remaining: final float32s]   <- full precision
 
 def serialize_message(msg: PhaseMessage) -> bytes:
     """Serialize a PhaseMessage to bytes for IPC.
 
     Format: JSON header (message_type, sender_id, metadata, timestamp)
-    followed by per-layer float32 arrays (with 4-byte length prefixes)
-    and the final phases array.
+    followed by quantized per-layer uint16 arrays (with 4-byte length
+    prefixes) and full-precision final phases as float32.
 
-    The phases are raw floats packed via struct, not encoded as strings.
-    The JSON header is minimal metadata only.
+    Layer phases use uint16 quantization (50% bandwidth reduction).
+    Final phases remain float32 for decoding precision.
     """
     header = json.dumps({
         "sender_id": msg.sender_id,
@@ -70,18 +97,19 @@ def serialize_message(msg: PhaseMessage) -> bytes:
 
     header_len = len(header)
 
-    # Pack per-layer arrays with length prefixes
-    def pack_optional_phases(phases: Optional[List[float]]) -> bytes:
+    # Pack per-layer arrays as quantized uint16 with length prefixes
+    def pack_quantized_phases(phases: Optional[List[float]]) -> bytes:
         if phases is None or len(phases) == 0:
             return struct.pack(">I", 0)
-        packed = struct.pack(f">{len(phases)}f", *phases)
+        quants = _quantize_phases(phases)
+        packed = struct.pack(f">{len(quants)}H", *quants)
         return struct.pack(">I", len(packed)) + packed
 
-    ast_packed = pack_optional_phases(msg.ast_phases)
-    cfg_packed = pack_optional_phases(msg.cfg_phases)
-    data_packed = pack_optional_phases(msg.data_phases)
+    ast_packed = pack_quantized_phases(msg.ast_phases)
+    cfg_packed = pack_quantized_phases(msg.cfg_phases)
+    data_packed = pack_quantized_phases(msg.data_phases)
 
-    # Final phases (no length prefix — they consume the remaining bytes)
+    # Final phases at full float32 precision (no length prefix — remaining bytes)
     phases_packed = struct.pack(f">{len(msg.phases)}f", *msg.phases)
 
     return (
@@ -107,24 +135,24 @@ def deserialize_message(data: bytes) -> PhaseMessage:
     header = json.loads(header_bytes.decode("utf-8"))
     offset += header_len
 
-    # Read per-layer arrays
-    def read_optional_phases(off: int):
+    # Read per-layer quantized uint16 arrays
+    def read_quantized_phases(off: int):
         if off + 4 > len(data):
             return None, off
         layer_len = struct.unpack(">I", data[off:off + 4])[0]
         off += 4
         if layer_len == 0:
             return None, off
-        n_floats = layer_len // 4
-        phases = list(struct.unpack(f">{n_floats}f", data[off:off + layer_len]))
+        n_shorts = layer_len // 2
+        quants = list(struct.unpack(f">{n_shorts}H", data[off:off + layer_len]))
         off += layer_len
-        return phases, off
+        return _dequantize_phases(quants), off
 
-    ast_phases, offset = read_optional_phases(offset)
-    cfg_phases, offset = read_optional_phases(offset)
-    data_phases, offset = read_optional_phases(offset)
+    ast_phases, offset = read_quantized_phases(offset)
+    cfg_phases, offset = read_quantized_phases(offset)
+    data_phases, offset = read_quantized_phases(offset)
 
-    # Read final phases (remaining bytes)
+    # Read final phases (remaining bytes, float32)
     phases_bytes = data[offset:]
     n_floats = len(phases_bytes) // 4
     if n_floats > 0:
