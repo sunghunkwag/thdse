@@ -88,32 +88,50 @@ def estimate_residual_dimension(
             "singular_values": [],
         }
 
-    # Step 1: Generate deterministic probe vectors
-    probe_handles = []
+    # Create an isolated temporary arena so that projection does not
+    # corrupt the live vectors (corpus axioms, vocab handles, etc.)
+    # in the main arena.  Extra capacity accounts for temporary handles
+    # that project_to_multi_quotient_space allocates internally during
+    # Gram-Schmidt orthogonalization.
+    temp_capacity = n_probes + 2 * k + 16
+    temp_arena = type(arena)(temp_capacity, total_dimension)
+
+    # Copy wall vectors into temp arena
+    temp_wall_handles = []
+    for wh in wall_handles:
+        phases = arena.extract_phases(wh)
+        temp_h = temp_arena.allocate()
+        temp_arena.inject_phases(temp_h, list(phases))
+        temp_wall_handles.append(temp_h)
+
+    # Step 1: Generate deterministic probe vectors in temp arena
+    temp_probe_handles = []
     for i in range(n_probes):
         seed = int(hashlib.md5(f"probe_{i}".encode("utf-8")).hexdigest()[:8], 16)
         phases = _deterministic_phases(seed, total_dimension)
-        h = arena.allocate()
-        arena.inject_phases(h, phases)
-        probe_handles.append(h)
+        h = temp_arena.allocate()
+        temp_arena.inject_phases(h, phases)
+        temp_probe_handles.append(h)
 
-    # Step 2: Project out all walls using multi-quotient if available,
-    # otherwise sequential single-vector projection
-    has_multi = hasattr(arena, 'project_to_multi_quotient_space')
-    if has_multi and wall_handles:
-        arena.project_to_multi_quotient_space(wall_handles)
+    # Step 2: Project out all walls in temp arena only
+    has_multi = hasattr(temp_arena, 'project_to_multi_quotient_space')
+    if has_multi and temp_wall_handles:
+        temp_arena.project_to_multi_quotient_space(temp_wall_handles)
     else:
-        for wh in wall_handles:
-            arena.project_to_quotient_space(wh)
+        for wh in temp_wall_handles:
+            temp_arena.project_to_quotient_space(wh)
 
-    # Step 3: Compute pairwise correlation matrix of probes
+    # Step 3: Compute pairwise correlation matrix of probes in temp arena
     corr_matrix = []
     for i in range(n_probes):
         row = []
         for j in range(n_probes):
-            corr = arena.compute_correlation(probe_handles[i], probe_handles[j])
+            corr = temp_arena.compute_correlation(
+                temp_probe_handles[i], temp_probe_handles[j])
             row.append(corr)
         corr_matrix.append(row)
+
+    # temp_arena goes out of scope — main arena untouched
 
     # Step 4: Compute singular values via power iteration on correlation matrix
     # (No numpy dependency — pure Python for minimal footprint)
@@ -193,42 +211,65 @@ def extract_open_directions(
     dimension = arena.get_dimension()
     wall_handles = wall_archive.all_handles()
     n_probes = max(n_directions * 3, 15)
+    k = len(wall_handles)
 
-    # Generate deterministic probe vectors
-    probe_handles = []
+    # Create an isolated temporary arena to avoid corrupting the main
+    # arena's live vectors with quotient projection side-effects.
+    # Extra capacity for internal allocations during multi-quotient.
+    temp_capacity = n_probes + 2 * k + 16
+    temp_arena = type(arena)(temp_capacity, dimension)
+
+    # Copy wall vectors into temp arena
+    temp_wall_handles = []
+    for wh in wall_handles:
+        phases = arena.extract_phases(wh)
+        temp_h = temp_arena.allocate()
+        temp_arena.inject_phases(temp_h, list(phases))
+        temp_wall_handles.append(temp_h)
+
+    # Generate deterministic probe vectors in temp arena
+    temp_probe_handles = []
+    probe_phase_arrays: List[List[float]] = []
     for i in range(n_probes):
         seed = int(hashlib.md5(f"open_probe_{i}".encode("utf-8")).hexdigest()[:8], 16)
         phases = _deterministic_phases(seed, dimension)
-        h = arena.allocate()
-        arena.inject_phases(h, phases)
-        probe_handles.append(h)
+        h = temp_arena.allocate()
+        temp_arena.inject_phases(h, phases)
+        temp_probe_handles.append(h)
+        probe_phase_arrays.append(phases)
 
-    # Project out all walls
-    has_multi = hasattr(arena, 'project_to_multi_quotient_space')
-    if has_multi and wall_handles:
-        arena.project_to_multi_quotient_space(wall_handles)
+    # Project out all walls in temp arena only
+    has_multi = hasattr(temp_arena, 'project_to_multi_quotient_space')
+    if has_multi and temp_wall_handles:
+        temp_arena.project_to_multi_quotient_space(temp_wall_handles)
     else:
-        for wh in wall_handles:
-            arena.project_to_quotient_space(wh)
+        for wh in temp_wall_handles:
+            temp_arena.project_to_quotient_space(wh)
 
-    # Compute variance: self-correlation after projection indicates how
-    # much of the probe survived. Higher = more "open" direction.
-    probe_variances = []
-    for i, ph in enumerate(probe_handles):
-        # Measure orthogonality to all walls (should be ~0 after projection)
+    # Compute variance: measure orthogonality to walls in temp arena.
+    # Higher variance = more "open" direction.
+    probe_variances: List[Tuple[int, float, List[float]]] = []
+    for i, temp_ph in enumerate(temp_probe_handles):
         wall_corr_sum = 0.0
-        for wh in wall_handles:
-            wall_corr_sum += abs(arena.compute_correlation(ph, wh))
-        avg_wall_corr = wall_corr_sum / max(len(wall_handles), 1)
-
-        # Variance = 1 - average wall correlation (higher = more open)
+        for twh in temp_wall_handles:
+            wall_corr_sum += abs(temp_arena.compute_correlation(temp_ph, twh))
+        avg_wall_corr = wall_corr_sum / max(k, 1)
         variance = 1.0 - avg_wall_corr
-        probe_variances.append((ph, variance))
+        # Extract the projected probe's phases from temp arena
+        projected_phases = list(temp_arena.extract_phases(temp_ph))
+        probe_variances.append((i, variance, projected_phases))
 
     # Sort by descending variance
     probe_variances.sort(key=lambda x: -x[1])
 
-    return probe_variances[:n_directions]
+    # Inject the top-k projected probes into the main arena as direction handles
+    result: List[Tuple[int, float]] = []
+    for _, variance, phases in probe_variances[:n_directions]:
+        h = arena.allocate()
+        arena.inject_phases(h, phases)
+        result.append((h, variance))
+
+    return result
 
 
 def synthesize_along_direction(
