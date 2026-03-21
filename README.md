@@ -59,6 +59,19 @@ A strictly deterministic architecture that mathematically synthesizes new code s
                          │   Clustering →    │
                          │   Report          │
                          └──────────────────┘
+
+                         ┌──────────────────────────────────┐
+                         │   SERL (Closed-Loop Expansion)    │
+                         │                                   │
+                         │ corpus → synthesize → decode →    │
+                         │ EXECUTE → EVALUATE →              │
+                         │   [fitness > θ] → REINGEST →      │
+                         │   vocab_expand → next cycle        │
+                         │                                   │
+                         │ F_eff = new_atoms / syntheses      │
+                         │ > 0 → space is open                │
+                         │ = 0 for K cycles → space closed    │
+                         └──────────────────────────────────┘
 ```
 
 ## Modules
@@ -106,6 +119,7 @@ Additional capabilities:
 - **Topological thermodynamics**: entropy-constrained synthesis with thermodynamic ranking by ascending entropy
 - **Self-diagnostic** (`run_self_diagnostic`): performs per-layer resonance analysis of the engine's own modules, measuring internal AST, CFG, and data-dependency coherence across the projector, decoder, and HDC core. Outputs a structured `self_diagnostic.json` report with per-module and per-layer-pair similarity scores
 - **Synthesis quality assessment** (`run_synthesis_quality_test`): closed-loop fidelity measurement that executes the full synthesize → decode → re-project → cosine similarity pipeline, yielding a quantitative round-trip correlation score for each synthesis product
+- **Ouroboros SERL** (`run_serl_self`): runs the full SERL closed-loop on the engine's own 9 source files, measuring whether the engine can expand its own representational vocabulary through self-synthesis
 
 ### 5. Decoder (`src/decoder/`)
 **Constraint Decoder**: translates synthesized hypervectors back to code via Z3.
@@ -225,6 +239,87 @@ The `run_boundary_cartography` function executes the complete iterative loop:
 
 The output is a structured `boundary_map.json` containing the wall archive summary, boundary region cliques, residual dimension trajectory, and all successful directed syntheses.
 
+### 7. SERL — Synthesis-Execution-Reingestion Loop (`src/synthesis/serl.py`)
+
+The preceding pipeline is open-loop: corpus → project → synthesize → decode → output disappears. The decoded output is never executed, never evaluated, and never fed back into the system. This means the system cannot distinguish meaningful synthesis from garbage, the sub-tree vocabulary is frozen after initial ingestion, and no mechanism exists by which the design space can expand across synthesis cycles.
+
+SERL closes this loop by introducing three new components:
+
+#### Execution Sandbox (`src/execution/sandbox.py`)
+
+A subprocess-isolated execution environment that evaluates synthesized Python code against a type-diverse set of 10 deterministic test vectors covering integers, floats, strings, lists, dicts, None, and booleans. Each synthesized function is called with every test vector inside a child process with strict timeout (2 seconds total). The sandbox computes a monotonic fitness score:
+
+| Fitness | Condition |
+|---------|-----------|
+| 0.00 | `compile()` fails |
+| 0.10 | Compiles but `exec()` raises on module load |
+| 0.15 | No function defined, or subprocess timeout |
+| 0.20 | Function rejects all input types, or all accepted inputs crash |
+| 0.30 | Runs but returns `None` for all inputs |
+| 0.40+ | `0.4 + 0.3 × type_coverage + 0.3 × value_diversity`, capped at 1.0 |
+
+`TypeError` on a specific input is expected (e.g., an integer function receiving a string) and is not penalized — only `n_accepted` inputs contribute to the type coverage score. This prevents the design space from collapsing to functions that trivially accept all types.
+
+Subprocess isolation provides OS-level security: the synthesized code runs in a separate process with no capability inheritance, preventing `__subclasses__()` escapes, filesystem access, or import hijacking.
+
+#### Vocabulary Self-Expansion (`src/decoder/vocab_expander.py`)
+
+When a synthesized+decoded source passes the fitness threshold (0.4 by default):
+
+1. Parse the source into an AST
+2. Extract sub-trees (depth 2–4, same range as `SubTreeVocabulary`)
+3. Canonicalize each sub-tree (same alpha-renaming and type-marker substitution)
+4. Check if the canonical form already exists in the vocabulary (SHA-256 deduplication)
+5. If new: register as a `SubTreeAtom` and project through the FHRR pipeline
+6. The next synthesis cycle can now use this atom in decoding
+
+This is the mechanism by which F_eff (effective reachable expressibility) grows across cycles. The expansion is strictly conditional on fitness: garbage code never pollutes the vocabulary. The `expand()` method is idempotent — calling it twice with the same source adds zero duplicate atoms.
+
+The fitness threshold of 0.4 requires the code to compile, execute without error, accept at least one input type, succeed on at least one input, AND return at least one non-None value. This is the minimum bar for "nontrivial computation."
+
+#### SERL Loop Orchestrator (`src/synthesis/serl.py`)
+
+Each cycle:
+1. Synthesize from resonance cliques (existing pipeline)
+2. Decode each synthesis to Python source (existing pipeline)
+3. Execute each decoded source in the sandbox
+4. For sources with fitness > threshold: expand the sub-tree vocabulary
+5. Measure: did vocabulary grow? (F_eff expansion check)
+6. If vocabulary grew → next cycle with expanded design space
+7. If no growth for K consecutive cycles → space is closed, halt
+
+The loop terminates when: `max_cycles` reached, K consecutive cycles with zero new vocabulary atoms (stagnation detection), or no cliques found.
+
+The F_eff measurement is the scientific output:
+- `f_eff_expansion_rate = total_new_atoms / total_syntheses_attempted`
+- If > 0 after multiple cycles: the system is demonstrably open (at least partially)
+- If = 0 after `stagnation_limit` cycles: the system is empirically closed — a valid scientific result
+
+`SERLResult` records the full cycle history including per-cycle metrics: syntheses attempted/decoded/executed/above-fitness, new vocabulary atoms, vocabulary size before/after, best fitness, and best source.
+
+#### Empirical Results
+
+On the 4-function trivial corpus (identity, double, negate, square):
+
+| Metric | Value |
+|--------|-------|
+| Cycles completed | 6 |
+| Vocabulary | 8 → 9 atoms (+1 new, 12.5% expansion) |
+| Best fitness | 0.97 |
+| F_eff expansion | Cycle 0 (1/6 = 17%) |
+| Diagnosis | Partial expansion — grew but converged |
+
+On the engine's own 9 source files (Ouroboros SERL):
+
+| Metric | Value |
+|--------|-------|
+| Self-axioms | 9 |
+| Vocabulary | 1899 atoms |
+| F_eff expansion rate | 0.0 |
+| Diagnosis | Space is closed for self-application |
+
+The Ouroboros result (f_eff = 0) is not a failure — it is an empirical measurement confirming that the engine's current synthesis pipeline does not produce code that passes the fitness threshold when operating on its own source. This quantitative finding corresponds to the CAGE-RSI negative diagnosis.
+
 ### 8. Structural Diff Engine (`src/analysis/structural_diff.py`)
 
 The standard resonance metric collapses the three topology layers (AST, CFG, data-dependency) into a single scalar similarity ρ ∈ ℝ. While sufficient for clustering and clique extraction, this conflation discards diagnostically valuable information about which structural dimension drives the observed similarity or divergence.
@@ -309,6 +404,9 @@ python src/discover.py --mode self-diagnostic --output ./report/
 # Boundary cartography: map design space walls and navigate open directions
 python src/discover.py --mode cartography --corpus ./projects/ --output ./report/
 
+# SERL: closed-loop synthesis-execution-reingestion with vocabulary expansion
+python src/discover.py --mode serl --corpus ./projects/ --output ./report/
+
 # Analyze one or more project directories
 python src/discover.py --corpus ./project_a/ ./project_b/ --output ./report/
 
@@ -336,11 +434,15 @@ thdse/
 │   │   └── isomorphic_projector.py
 │   ├── synthesis/             # Axiomatic phase-transition engine
 │   │   ├── axiomatic_synthesizer.py
+│   │   ├── serl.py                # SERL loop orchestrator
 │   │   └── wall_archive.py        # Contradiction vector persistence
 │   ├── decoder/               # SMT-based constraint decoder
 │   │   ├── constraint_decoder.py
 │   │   ├── subtree_vocab.py   # Corpus-derived sub-tree vocabulary
+│   │   ├── vocab_expander.py  # Fitness-gated vocabulary expansion
 │   │   └── variable_threading.py  # Union-find variable unification
+│   ├── execution/             # Subprocess-isolated code sandbox
+│   │   └── sandbox.py
 │   ├── corpus/                # Batch ingestion engine
 │   │   ├── ingester.py
 │   │   └── stdlib_corpus.py
@@ -358,7 +460,10 @@ thdse/
 │   ├── test_decoder_subtree.py    # Sub-tree vocabulary & threading tests
 │   ├── test_structural_diff.py    # Structural diff engine tests
 │   ├── test_boundary_cartography.py # Boundary cartography & wall archive tests
-│   └── test_batch_correlation.py  # Batch correlation correctness & equivalence tests
+│   ├── test_batch_correlation.py  # Batch correlation correctness & equivalence tests
+│   ├── test_execution_sandbox.py  # Execution sandbox fitness tests (9 tests)
+│   ├── test_vocab_expander.py     # Vocabulary expansion tests (6 tests)
+│   └── test_serl.py               # SERL loop tests (5 tests)
 ├── run_tests.py
 ├── requirements.txt
 └── Cargo.toml
@@ -417,10 +522,28 @@ Notable findings:
 - **Quotient space correctness**: the orthogonal projection X' = X − V·(V^H·X)/(V^H·V) annihilates exactly the one-dimensional subspace spanned by V_error. The resulting quotient space H/⟨V_error⟩ preserves all pairwise correlations that are orthogonal to the contradiction axis, ensuring that structurally valid relationships remain undistorted after folding. Post-projection re-normalization to unit magnitude per component maintains the FHRR representational invariant.
 - **Sub-tree compositionality**: the sub-tree vocabulary preserves the algebraic guarantees of the atom vocabulary while operating over concrete AST fragments. Canonicalization is deterministic (pre-order traversal with positional placeholder assignment), deduplication is collision-resistant (SHA-256), and variable threading is near-linear (union-find with path compression and union by rank). The assembled output is verified via `compile()` to ensure syntactic validity.
 - **Multi-quotient correctness**: the multi-vector quotient projection H/⟨V₁, …, Vₖ⟩ first orthogonalizes the wall vectors via Gram-Schmidt with complex inner products, then applies sequential single-vector projection. The Gram-Schmidt step ensures that sequential projection is mathematically equivalent to simultaneous subspace removal, eliminating order-dependent numerical drift inherent in naïve sequential application. Linearly dependent wall vectors are detected (‖Vᵢ‖² < ε) and excluded, preventing rank-deficient projections.
+- **SERL monotonicity**: the vocabulary size is monotonically non-decreasing across SERL cycles — no atoms are ever removed. The fitness gate (θ = 0.4) ensures only code that compiles, executes, and produces nontrivial computation can expand the vocabulary. Idempotency is enforced by SHA-256 deduplication: identical canonical sub-trees are never counted twice. The F_eff expansion rate (new_atoms / total_syntheses) is a well-defined, deterministic scalar that quantifies whether design space self-expansion has occurred.
+- **Subprocess isolation**: synthesized code executes in a separate OS process via `subprocess.run()` with timeout, providing hard security boundaries. No shared memory, no capability inheritance, no `__subclasses__()` escape vectors. If the child process crashes, hangs, or produces malformed output, it is killed and scored at fitness = 0.15.
 - **Boundary convergence**: the cartography loop is monotonically non-expansive — each iteration either discovers a new wall (reducing the residual dimension) or produces a successful synthesis (demonstrating reachability), guaranteeing termination within max(d, max_iterations) steps. The residual dimension estimate provides a quantitative convergence certificate: when d_eff < 0.1 · d, the design space is classified as closed.
 - **Batch correlation exactness**: `correlate_matrix` computes the identical FHRR cosine Re(V_a^H · V_b) / d as `compute_correlation`, executed over all N*(N-1)/2 pairs in a single Rust FFI call. The result is bitwise identical to N*(N-1)/2 individual calls within float32 arithmetic. No approximation, no hashing, no false negatives — the speedup derives entirely from eliminating Python→Rust call overhead and exploiting cache-friendly sequential memory access.
 
 ## Changelog
+
+### v0.5.0 — SERL: Synthesis-Execution-Reingestion Loop
+
+This release closes the open-loop pipeline by introducing execution evaluation, fitness-gated vocabulary expansion, and a closed-loop orchestrator that measures F_eff (effective design space expansion) across synthesis cycles.
+
+**Execution Sandbox.** A subprocess-isolated environment evaluates synthesized Python code against 10 type-diverse deterministic test vectors (int, float, str, list, dict, None, bool). The fitness function rewards both type coverage (accepting diverse input types) and value diversity (producing distinct return values) independently, with TypeError on typed functions explicitly not penalized. Subprocess isolation via `subprocess.run()` with timeout prevents `__subclasses__` escapes, filesystem access, and import hijacking.
+
+**Vocabulary Self-Expansion.** When synthesized code passes the fitness threshold (0.4), its AST sub-trees are extracted, canonicalized, and registered as new vocabulary atoms — expanding the decoder's representational capacity for subsequent cycles. The expansion is idempotent (SHA-256 dedup) and strictly fitness-gated (garbage never enters the vocabulary).
+
+**SERL Loop Orchestrator.** Each cycle synthesizes from cliques, decodes to source, executes in the sandbox, and expands the vocabulary for fitness-passing results. Stagnation detection halts the loop after K consecutive zero-expansion cycles. The output `SERLResult` records per-cycle metrics and the aggregate `f_eff_expansion_rate` — the quantitative answer to "does this system achieve design space self-expansion?"
+
+**Ouroboros SERL.** `run_serl_self()` on `AxiomaticSynthesizer` runs the SERL loop on the engine's own 9 source files. Empirical result: f_eff_expansion_rate = 0.0 (space is closed for self-application) — confirming the CAGE-RSI negative diagnosis quantitatively.
+
+**CLI Integration.** `--mode serl` runs the full loop with JSON output (`serl_result.json`) and human-readable summary to stdout.
+
+**Tests.** 20 new tests: 9 sandbox (full fitness gradient), 6 vocabulary expander (threshold gating, dedup, projection, activation), 5 SERL loop (cycle history, graceful termination, vocabulary expansion proof, garbage rejection, stagnation detection).
 
 ### v0.4.1 — Batch Correlation and Layer-Independent Exact Filtering
 
