@@ -480,6 +480,127 @@ def _run_cartography(args, arena, projector, synthesizer, verbose):
         print(f"\n  JSON: {json_path}")
 
 
+def _run_serl(args, arena, projector, synthesizer, verbose):
+    """Run the Synthesis-Execution-Reingestion Loop (SERL)."""
+    from src.decoder.constraint_decoder import ConstraintDecoder
+    from src.decoder.subtree_vocab import SubTreeVocabulary
+    from src.decoder.vocab_expander import VocabularyExpander
+    from src.execution.sandbox import ExecutionSandbox
+    from src.synthesis.serl import SERLLoop
+    from dataclasses import asdict
+
+    total_axioms = synthesizer.store.count()
+    if total_axioms < 2:
+        print("ERROR: Need at least 2 axioms for SERL.")
+        sys.exit(1)
+
+    if verbose:
+        print("Building sub-tree vocabulary from corpus...")
+
+    # Build sub-tree vocabulary from corpus directories
+    vocab = SubTreeVocabulary()
+    if args.corpus:
+        for corpus_dir in args.corpus:
+            for root, _dirs, files in os.walk(corpus_dir):
+                for fname in files:
+                    if fname.endswith(".py"):
+                        vocab.ingest_file(os.path.join(root, fname))
+
+    if verbose:
+        summary = vocab.summary()
+        print(f"  Sub-tree vocabulary: {summary['unique_subtrees']} unique patterns")
+
+    # Project sub-tree atoms
+    projected = vocab.project_all(arena, projector)
+    if verbose:
+        print(f"  Projected {projected} sub-tree atoms")
+
+    # Create decoder with sub-tree vocabulary
+    decoder = ConstraintDecoder(
+        arena, projector, args.dimension,
+        activation_threshold=0.04,
+        subtree_vocab=vocab,
+    )
+
+    # Create SERL components
+    sandbox = ExecutionSandbox()
+    expander = VocabularyExpander()
+    loop = SERLLoop()
+
+    if verbose:
+        print("Running SERL loop...")
+
+    result = loop.run(
+        arena, projector, synthesizer, decoder,
+        sandbox, expander, vocab,
+        max_cycles=20,
+        stagnation_limit=5,
+        fitness_threshold=0.4,
+    )
+
+    # Print human-readable summary
+    expansion_cycles = [c for c in result.cycle_history if c.f_eff_expanded]
+    expansion_pct = (
+        f"{len(expansion_cycles)}/{result.cycles_completed} = "
+        f"{100 * len(expansion_cycles) / max(result.cycles_completed, 1):.0f}%"
+    )
+    best_fitness = max((c.best_fitness for c in result.cycle_history), default=0.0)
+    mean_fitness = (
+        sum(c.best_fitness for c in result.cycle_history) / max(result.cycles_completed, 1)
+    )
+
+    print(f"\nSERL completed: {result.cycles_completed} cycles")
+    print(
+        f"  Vocabulary: {result.vocab_size_initial} → {result.vocab_size_final} atoms "
+        f"(+{result.total_new_atoms} new, "
+        f"{100 * result.total_new_atoms / max(result.vocab_size_initial, 1):.1f}% expansion)"
+    )
+    print(f"  Fitness: best={best_fitness:.2f}, mean={mean_fitness:.2f}")
+    print(f"  F_eff expanded: cycles {','.join(str(c.cycle_index) for c in expansion_cycles)} ({expansion_pct})")
+    stag_at_end = sum(
+        1 for c in reversed(result.cycle_history) if not c.f_eff_expanded
+    )
+    print(f"  Stagnation: {stag_at_end} consecutive zero-expansion cycles at end")
+    print(f"  Diagnosis: {result.convergence_diagnosis}")
+
+    # Serialize to JSON
+    os.makedirs(args.output, exist_ok=True)
+    json_path = os.path.join(args.output, "serl_result.json")
+
+    # Convert dataclasses to dicts for JSON serialization
+    result_dict = {
+        "cycles_completed": result.cycles_completed,
+        "total_new_atoms": result.total_new_atoms,
+        "vocab_size_initial": result.vocab_size_initial,
+        "vocab_size_final": result.vocab_size_final,
+        "f_eff_expansion_rate": result.f_eff_expansion_rate,
+        "space_closed": result.space_closed,
+        "convergence_diagnosis": result.convergence_diagnosis,
+        "cycle_history": [
+            {
+                "cycle_index": c.cycle_index,
+                "syntheses_attempted": c.syntheses_attempted,
+                "syntheses_decoded": c.syntheses_decoded,
+                "syntheses_executed": c.syntheses_executed,
+                "syntheses_above_fitness": c.syntheses_above_fitness,
+                "new_vocab_atoms": c.new_vocab_atoms,
+                "vocab_size_before": c.vocab_size_before,
+                "vocab_size_after": c.vocab_size_after,
+                "f_eff_expanded": c.f_eff_expanded,
+                "best_fitness": c.best_fitness,
+                "best_source": c.best_source,
+            }
+            for c in result.cycle_history
+        ],
+    }
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(result_dict, f, indent=2)
+
+    if verbose:
+        print(f"\n  JSON: {json_path}")
+
+
 def main() -> None:
     """Run the structural discovery pipeline."""
     parser = argparse.ArgumentParser(
@@ -488,9 +609,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["analysis", "diff", "refactor", "synthesis", "self-diagnostic", "cartography"],
+        choices=["analysis", "diff", "refactor", "synthesis", "self-diagnostic", "cartography", "serl"],
         default="analysis",
-        help="Pipeline mode: analysis (default), diff, refactor, synthesis, self-diagnostic, cartography.",
+        help="Pipeline mode: analysis (default), diff, refactor, synthesis, self-diagnostic, cartography, serl.",
     )
     parser.add_argument(
         "--corpus",
@@ -561,7 +682,7 @@ def main() -> None:
             parser.error("--mode diff requires exactly 2 file paths as positional arguments")
     elif mode == "self-diagnostic":
         pass  # No corpus required
-    elif mode in ("analysis", "refactor", "synthesis", "cartography"):
+    elif mode in ("analysis", "refactor", "synthesis", "cartography", "serl"):
         if not args.corpus and not args.stdlib and not args.load:
             parser.error("Specify --corpus, --stdlib, or --load")
 
@@ -600,6 +721,9 @@ def main() -> None:
 
     elif mode == "cartography":
         _run_cartography(args, arena, projector, synthesizer, verbose)
+
+    elif mode == "serl":
+        _run_serl(args, arena, projector, synthesizer, verbose)
 
     t_end = time.time()
     if verbose:
