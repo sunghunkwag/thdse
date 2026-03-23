@@ -39,6 +39,39 @@ from src.swarm.consensus import ConsensusResult, compute_swarm_consensus
 logger = logging.getLogger(__name__)
 
 
+def _agent_synthesis_worker(
+    agent_id: int,
+    config: SwarmConfig,
+    corpus_dict: Dict[str, str],
+    wall_phases_list: List[List[float]],
+    max_cliques: int,
+) -> List[PhaseMessage]:
+    """Top-level worker for ProcessPoolExecutor.
+
+    Instantiates a fresh ThdseAgent in the child process (with its own
+    FhrrArena and Z3 solver), ingests the corpus, replays accumulated
+    walls, runs local synthesis, and returns only the picklable
+    PhaseMessage list through the IPC queue.
+
+    Args:
+        agent_id: Agent index for sender_id tagging.
+        config: SwarmConfig (pure dataclass, fully picklable).
+        corpus_dict: {source_id: source_code} for this agent's corpus.
+        wall_phases_list: Accumulated wall phase arrays to replay.
+        max_cliques: Max cliques for synthesis.
+
+    Returns:
+        List of PhaseMessage candidates (float arrays + basic metadata).
+    """
+    agent = ThdseAgent(agent_id, config, [])
+    agent.ingest_corpus_dict(corpus_dict)
+
+    for wall_phases in wall_phases_list:
+        agent.receive_wall_broadcast(wall_phases)
+
+    return agent.run_local_synthesis(max_cliques=max_cliques)
+
+
 @dataclass
 class WallLedgerEntry:
     """A record in the orchestrator's global wall ledger.
@@ -137,6 +170,18 @@ class SwarmOrchestrator:
 
         # Global wall ledger for drift reconciliation
         self._wall_ledger: List[WallLedgerEntry] = []
+
+        # Per-agent corpus dicts for process-based parallel synthesis.
+        # Populated by ingest_agent_corpora_dicts(); file-based corpora
+        # are handled via corpus_paths in config.
+        self._agent_corpus_dicts: List[Dict[str, str]] = [
+            {} for _ in range(config.n_agents)
+        ]
+
+        # Per-agent accumulated wall phases for replay in worker processes
+        self._agent_wall_history: List[List[List[float]]] = [
+            [] for _ in range(config.n_agents)
+        ]
 
     def _build_merged_vocab(self) -> None:
         """Merge SubTreeVocabulary from ALL agents into the orchestrator's decoder.
@@ -374,15 +419,34 @@ class SwarmOrchestrator:
         )
 
     def _collect_candidates(self) -> List[PhaseMessage]:
-        """Run local synthesis on all agents in parallel, collect emitted candidates.
+        """Run local synthesis on all agents in parallel via ProcessPoolExecutor.
 
-        Uses ProcessPoolExecutor to run each agent's synthesis concurrently.
+        Each worker process instantiates a fresh ThdseAgent with its own
+        FhrrArena (Rust FFI) and Z3 solver, avoiding any IPC serialization
+        of unpicklable objects. Only primitive arguments (config, corpus dicts,
+        wall phase arrays) cross the process boundary. PhaseMessage results
+        contain only float arrays and basic metadata — fully picklable.
+
+        Falls back to sequential execution if only one agent is present.
         """
+        if len(self.agents) <= 1:
+            all_candidates: List[PhaseMessage] = []
+            for agent in self.agents:
+                all_candidates.extend(agent.run_local_synthesis(max_cliques=10))
+            return all_candidates
+
         all_candidates: List[PhaseMessage] = []
         with ProcessPoolExecutor(max_workers=len(self.agents)) as executor:
             futures = {
-                executor.submit(agent.run_local_synthesis, max_cliques=10): agent
-                for agent in self.agents
+                executor.submit(
+                    _agent_synthesis_worker,
+                    agent_id=i,
+                    config=self.config,
+                    corpus_dict=self._agent_corpus_dicts[i],
+                    wall_phases_list=self._agent_wall_history[i],
+                    max_cliques=10,
+                ): i
+                for i in range(len(self.agents))
             }
             for future in as_completed(futures):
                 candidates = future.result()
@@ -410,6 +474,7 @@ class SwarmOrchestrator:
         for agent in self.agents:
             if agent.agent_id in targeted:
                 agent.receive_wall_broadcast(wall_phases)
+                self._agent_wall_history[agent.agent_id].append(wall_phases)
 
         # Record in wall ledger for drift reconciliation
         entry = WallLedgerEntry(
@@ -459,6 +524,7 @@ class SwarmOrchestrator:
             for agent_id in sorted(missing):
                 agent = agent_map[agent_id]
                 agent.receive_wall_broadcast(entry.wall_phases)
+                self._agent_wall_history[agent_id].append(entry.wall_phases)
                 entry.applied_to.add(agent_id)
                 walls_applied += 1
 
@@ -533,8 +599,9 @@ class SwarmOrchestrator:
                 f"Expected {self.config.n_agents} corpora, got {len(corpora)}"
             )
 
-        for agent, corpus in zip(self.agents, corpora):
+        for i, (agent, corpus) in enumerate(zip(self.agents, corpora)):
             agent.ingest_corpus_dict(corpus)
+            self._agent_corpus_dicts[i] = corpus
 
         # Build merged vocabulary
         self._build_merged_vocab()
