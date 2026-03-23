@@ -153,7 +153,8 @@ A strictly deterministic architecture that mathematically synthesizes new code s
   │  4. Decode consensus → Z3 → Python AST                       │
   │                                                               │
   │     SAT → sandbox → fitness gate → expand vocab               │
-  │     UNSAT → extract V_error → broadcast to ALL agents         │
+  │     UNSAT → extract V_error → broadcast to PARTICIPATING agents│
+  │       (drift reconciliation propagates aged walls gradually)   │
   └───────┬──────────┬──────────┬──────────┬──────────────────────┘
           │          │          │          │
     ┌─────▼─────┐┌───▼─────┐┌──▼──────┐┌──▼────────┐
@@ -170,6 +171,8 @@ A strictly deterministic architecture that mathematically synthesizes new code s
 
   Key: Each agent has a DIFFERENT corpus (heterogeneity is critical).
        Communication is via raw FHRR phase arrays — no text, no LLMs.
+       UNSAT walls target only clique participants (Localized Quotient Isolation).
+       Aged walls propagate to non-participants via drift reconciliation.
 ```
 
 ### Boundary Cartography
@@ -630,6 +633,9 @@ python src/discover.py --mode swarm --stdlib --n-agents 3 --output ./report/
 # Swarm with explicit per-agent corpora
 python src/discover.py --mode swarm --corpus ./math/ ./sys/ ./net/ --n-agents 3 --output ./report/
 
+# Empirical validation report against stdlib (reproducible JSON + Markdown)
+python src/discover.py --mode empirical --output ./report/
+
 # Analyze one or more project directories
 python src/discover.py --corpus ./project_a/ ./project_b/ --output ./report/
 
@@ -639,6 +645,8 @@ python src/discover.py --corpus ./projects/ --save corpus.pkl --output ./report/
 # Reload a saved corpus without re-ingesting
 python src/discover.py --load corpus.pkl --output ./report/
 ```
+
+`--mode empirical` runs a self-contained stdlib analysis pipeline that outputs `empirical_validation.json` and `empirical_validation.md` with ingestion stats, resonance matrix statistics, verified structural family cliques (with intra/inter-clique resonance), top-20 cross-directory pairs with per-layer decomposition, and structural outliers. Memory-bounded to run within 4GB.
 
 Configurable parameters: `--dimension` (default: 256), `--capacity` (default: 2M handles), `--threshold` (resonance τ, default: 0.15), `--max-files`, `--n-agents` (swarm mode, default: 3), `--consensus-threshold` (swarm mode, default: 0.85).
 
@@ -675,12 +683,13 @@ thdse/
 │   │   ├── structural_diff.py     # Layer-decomposed similarity
 │   │   ├── refactoring_detector.py # Duplicate & unification detection
 │   │   ├── temporal_diff.py       # Version-to-version change classification
-│   │   └── boundary_cartography.py # Design space boundary mapping
+│   │   ├── boundary_cartography.py # Design space boundary mapping
+│   │   └── empirical_report.py    # Reproducible stdlib validation report
 │   ├── swarm/                 # Multi-agent collective intelligence
 │   │   ├── protocol.py            # PhaseMessage, SwarmConfig, serialization
 │   │   ├── consensus.py           # Resonance clique consensus (Bron-Kerbosch)
 │   │   ├── agent.py               # ThdseAgent (independent THDSE pipeline)
-│   │   ├── orchestrator.py        # SwarmOrchestrator (Global Quotient Collapse)
+│   │   ├── orchestrator.py        # SwarmOrchestrator (Localized Quotient Isolation)
 │   │   └── swarm_serl.py          # Swarm-level SERL entry point
 │   ├── utils/                 # Phase algebra utilities
 │   │   └── arena_ops.py
@@ -693,7 +702,9 @@ thdse/
 │   ├── test_execution_sandbox.py  # Execution sandbox fitness tests (9 tests)
 │   ├── test_vocab_expander.py     # Vocabulary expansion tests (6 tests)
 │   ├── test_serl.py               # SERL loop tests (5 tests)
-│   └── test_swarm.py              # Swarm integration tests (22 tests)
+│   ├── test_swarm.py              # Swarm integration tests (22 tests)
+│   ├── test_nesting_decoder.py    # Hierarchical nesting constraint tests (4 tests)
+│   └── test_empirical_report.py   # Empirical validation report tests (2 tests)
 ├── run_tests.py
 ├── requirements.txt
 └── Cargo.toml
@@ -808,7 +819,7 @@ This release introduces the Swarm subsystem: N independent THDSE agents that com
 
 **Resonance Clique Consensus.** Candidate vectors from all agents are injected into a temporary arena (created fresh each round), correlated via a single `correlate_matrix` FFI call, and submitted to Bron-Kerbosch clique extraction. The largest clique above the consensus threshold (default: ρ > 0.85) is bundled into a centroid vector representing the algebraic consensus.
 
-**Global Quotient Collapse.** When the orchestrator's decoder returns UNSAT for the consensus centroid, the contradiction vector V_error is broadcast to ALL agents, each of which immediately projects its entire arena to the quotient space H/⟨V_error⟩. This collapses the contradiction axis from every agent's memory simultaneously — a coordinated algebraic operation that no single agent could perform in isolation.
+**Localized Quotient Isolation.** When the orchestrator's decoder returns UNSAT for the consensus centroid, the contradiction vector V_error is broadcast to the PARTICIPATING agents (those whose candidates formed the consensus clique), each of which immediately projects its entire arena to the quotient space H/⟨V_error⟩. Non-participating agents receive aged walls gradually via drift reconciliation, preventing unnecessary disruption of unrelated synthesis trajectories.
 
 **Merged Vocabulary.** The orchestrator's decoder merges `SubTreeVocabulary` atoms from all agents, enabling it to decode structures that no individual agent could decode alone. This is the mechanism by which heterogeneous corpora produce collective capability exceeding any individual.
 
