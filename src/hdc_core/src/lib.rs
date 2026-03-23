@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 use pyo3::exceptions::{PyValueError, PyIndexError};
+#[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 use std::ptr;
 
@@ -72,7 +73,18 @@ impl FhrrArena {
     }
 
     pub fn bind(&mut self, h1: usize, h2: usize, out_handle: usize) -> PyResult<()> {
-        unsafe { self.bind_simd(h1, h2, out_handle)?; }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                unsafe { self.bind_simd(h1, h2, out_handle)?; }
+            } else {
+                self.bind_scalar(h1, h2, out_handle)?;
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            self.bind_scalar(h1, h2, out_handle)?;
+        }
         // Track thermodynamic cost: each bind adds ln(2) entropy
         if out_handle < self.capacity {
             self.op_counts[out_handle].0 += 1;
@@ -82,7 +94,18 @@ impl FhrrArena {
 
     pub fn bundle(&mut self, handles: Vec<usize>, out_handle: usize) -> PyResult<()> {
         let fan_in = handles.len() as u32;
-        unsafe { self.bundle_simd(handles, out_handle)?; }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") {
+                unsafe { self.bundle_simd(handles, out_handle)?; }
+            } else {
+                self.bundle_scalar(handles, out_handle)?;
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            self.bundle_scalar(handles, out_handle)?;
+        }
         // Track thermodynamic cost: bundle of k handles adds k×ln(2) entropy
         if out_handle < self.capacity {
             self.op_counts[out_handle].1 += fan_in;
@@ -207,7 +230,18 @@ impl FhrrArena {
         let floats = self.dimension * 2;
 
         // Step 1: Compute bundle into out_handle (temporary use)
-        unsafe { self.bundle_simd(handles_bundle, out_handle)?; }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") {
+                unsafe { self.bundle_simd(handles_bundle, out_handle)?; }
+            } else {
+                self.bundle_scalar(handles_bundle, out_handle)?;
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            self.bundle_scalar(handles_bundle, out_handle)?;
+        }
 
         // Step 2: Bind h_bind with bundled result in-place
         // We need a temporary copy of the bundle result
@@ -303,7 +337,13 @@ impl FhrrArena {
     /// Memory: in-place modification, no auxiliary arena allocation.
     pub fn project_to_quotient_space(&mut self, v_error_id: usize) -> PyResult<usize> {
         self.validate_handles(&[v_error_id])?;
-        unsafe { self.project_to_quotient_space_simd(v_error_id) }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                return unsafe { self.project_to_quotient_space_simd(v_error_id) };
+            }
+        }
+        self.project_to_quotient_space_scalar(v_error_id)
     }
 
     /// Project the arena into the quotient space H / <V₁, V₂, ..., Vₙ>.
@@ -427,7 +467,7 @@ impl FhrrArena {
                 .copy_from_slice(&workspace[i]);
 
             // Project it out from all arena vectors
-            let count = unsafe { self.project_to_quotient_space_simd(temp_h)? };
+            let count = self.project_to_quotient_space(temp_h)?;
             total_projected += count;
         }
 
@@ -524,6 +564,125 @@ impl FhrrArena {
 }
 
 impl FhrrArena {
+    // ── Scalar fallback implementations (safe, no SIMD required) ────
+
+    fn bind_scalar(&mut self, h1: usize, h2: usize, out_handle: usize) -> PyResult<()> {
+        self.validate_handles(&[h1, h2, out_handle])?;
+        let floats = self.dimension * 2;
+        for i in 0..self.dimension {
+            let idx1 = h1 * floats + 2 * i;
+            let idx2 = h2 * floats + 2 * i;
+            let idx_out = out_handle * floats + 2 * i;
+            let re1 = self.buffer[idx1];
+            let im1 = self.buffer[idx1 + 1];
+            let re2 = self.buffer[idx2];
+            let im2 = self.buffer[idx2 + 1];
+            self.buffer[idx_out] = re1 * re2 - im1 * im2;
+            self.buffer[idx_out + 1] = re1 * im2 + im1 * re2;
+        }
+        Ok(())
+    }
+
+    fn bundle_scalar(&mut self, handles: Vec<usize>, out_handle: usize) -> PyResult<()> {
+        if handles.is_empty() { return Ok(()); }
+        self.validate_handles(&handles)?;
+        self.validate_handles(&[out_handle])?;
+        let floats = self.dimension * 2;
+        let out_start = out_handle * floats;
+        // Zero the output region
+        for i in 0..floats {
+            self.buffer[out_start + i] = 0.0;
+        }
+        // Accumulate all handles
+        for h in &handles {
+            let h_start = h * floats;
+            for i in 0..floats {
+                self.buffer[out_start + i] += self.buffer[h_start + i];
+            }
+        }
+        // Normalize each complex component to unit magnitude
+        for i in 0..self.dimension {
+            let idx = out_start + 2 * i;
+            let re = self.buffer[idx];
+            let im = self.buffer[idx + 1];
+            let mag = (re * re + im * im).sqrt();
+            if mag > 1e-12 {
+                let inv_mag = 1.0 / mag;
+                self.buffer[idx] = re * inv_mag;
+                self.buffer[idx + 1] = im * inv_mag;
+            }
+        }
+        Ok(())
+    }
+
+    fn project_to_quotient_space_scalar(&mut self, v_error_id: usize) -> PyResult<usize> {
+        let floats = self.dimension * 2;
+        let v_offset = v_error_id * floats;
+
+        // Compute ||V_error||²
+        let mut norm_sq: f32 = 0.0;
+        for i in 0..floats {
+            let val = self.buffer[v_offset + i];
+            norm_sq += val * val;
+        }
+        if norm_sq < 1e-12 {
+            return Ok(0);
+        }
+        let inv_norm_sq = 1.0 / norm_sq;
+        let mut projected_count: usize = 0;
+
+        for h in 0..self.head {
+            if h == v_error_id { continue; }
+            let x_offset = h * floats;
+
+            // Pass 1: Complex inner product <V_error, X>
+            let mut dot_re: f32 = 0.0;
+            let mut dot_im: f32 = 0.0;
+            for j in 0..self.dimension {
+                let v_re = self.buffer[v_offset + 2 * j];
+                let v_im = self.buffer[v_offset + 2 * j + 1];
+                let x_re = self.buffer[x_offset + 2 * j];
+                let x_im = self.buffer[x_offset + 2 * j + 1];
+                dot_re += v_re * x_re + v_im * x_im;
+                dot_im += v_re * x_im - v_im * x_re;
+            }
+
+            let coeff_re = dot_re * inv_norm_sq;
+            let coeff_im = dot_im * inv_norm_sq;
+            if coeff_re * coeff_re + coeff_im * coeff_im < 1e-16 {
+                continue;
+            }
+
+            // Pass 2: X -= V · c, then normalize
+            for j in 0..self.dimension {
+                let v_re = self.buffer[v_offset + 2 * j];
+                let v_im = self.buffer[v_offset + 2 * j + 1];
+                let proj_re = v_re * coeff_re - v_im * coeff_im;
+                let proj_im = v_re * coeff_im + v_im * coeff_re;
+                self.buffer[x_offset + 2 * j] -= proj_re;
+                self.buffer[x_offset + 2 * j + 1] -= proj_im;
+            }
+
+            // Normalize to unit magnitude
+            for j in 0..self.dimension {
+                let idx = x_offset + 2 * j;
+                let re = self.buffer[idx];
+                let im = self.buffer[idx + 1];
+                let mag = (re * re + im * im).sqrt();
+                if mag > 1e-12 {
+                    let inv_mag = 1.0 / mag;
+                    self.buffer[idx] = re * inv_mag;
+                    self.buffer[idx + 1] = im * inv_mag;
+                }
+            }
+            projected_count += 1;
+        }
+        Ok(projected_count)
+    }
+
+    // ── AVX2 SIMD implementations (guarded by runtime detection) ────
+
+    #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2", enable = "fma")]
     unsafe fn bind_simd(&mut self, h1: usize, h2: usize, out_handle: usize) -> PyResult<()> {
         self.validate_handles(&[h1, h2, out_handle])?;
@@ -536,7 +695,8 @@ impl FhrrArena {
         let mut p_out = p_buf.add(out_handle * floats);
         let end = p1.add(floats);
         
-        while p1 < end.sub(7) {
+        let simd_end = end.sub(floats % 8);
+        while p1 < simd_end {
             let a = _mm256_loadu_ps(p1);
             let b = _mm256_loadu_ps(p2);
 
@@ -551,7 +711,7 @@ impl FhrrArena {
             let result = _mm256_addsub_ps(res1, res2);
 
             _mm256_storeu_ps(p_out, result);
-            
+
             p1 = p1.add(8);
             p2 = p2.add(8);
             p_out = p_out.add(8);
@@ -570,6 +730,7 @@ impl FhrrArena {
         Ok(())
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
     unsafe fn bundle_simd(&mut self, handles: Vec<usize>, out_handle: usize) -> PyResult<()> {
         if handles.is_empty() { return Ok(()); }
@@ -586,8 +747,9 @@ impl FhrrArena {
             let mut p_curr = p_buf.add(h * floats);
             let mut p_out_curr = p_out;
             let end = p_curr.add(floats);
+            let simd_end = end.sub(floats % 8);
 
-            while p_curr < end.sub(7) {
+            while p_curr < simd_end {
                 let v_out = _mm256_loadu_ps(p_out_curr);
                 let v_curr = _mm256_loadu_ps(p_curr);
                 let summed = _mm256_add_ps(v_out, v_curr);
@@ -607,6 +769,7 @@ impl FhrrArena {
         Ok(())
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
     unsafe fn normalize_simd(&mut self, handle: usize) -> PyResult<()> {
         let floats = self.dimension * 2;
@@ -614,7 +777,8 @@ impl FhrrArena {
         let mut p_vec = p_buf.add(handle * floats);
         let end = p_vec.add(floats);
 
-        while p_vec < end.sub(7) {
+        let simd_end = end.sub(floats % 8);
+        while p_vec < simd_end {
             let v = _mm256_loadu_ps(p_vec);
             let sq = _mm256_mul_ps(v, v);
             
@@ -688,6 +852,7 @@ impl FhrrArena {
     ///   Pass 2 (SIMD):   X -= V_error · (<V_error^H · X> / ||V_error||²), then normalize
     ///
     /// Returns the number of vectors projected.
+    #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2", enable = "fma")]
     unsafe fn project_to_quotient_space_simd(&mut self, v_error_id: usize) -> PyResult<usize> {
         let floats = self.dimension * 2;
@@ -762,8 +927,9 @@ impl FhrrArena {
             let mut p_v = p_buf.add(v_offset);
             let mut p_x = p_buf.add(x_offset);
             let end = p_v.add(floats);
+            let simd_end = end.sub(floats % 8);
 
-            while p_v < end.sub(7) {
+            while p_v < simd_end {
                 let v_vec = _mm256_loadu_ps(p_v);
                 let x_vec = _mm256_loadu_ps(p_x);
 
