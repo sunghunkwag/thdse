@@ -1,4 +1,5 @@
 import ast
+import zlib
 import networkx as nx
 import numpy as np
 
@@ -7,7 +8,7 @@ class TopologicalASTGraphCA:
         self.steps = steps
 
     def get_node_seed(self, node_type: str) -> float:
-        h = hash(node_type) & 0xFFFFFFFF
+        h = zlib.crc32(node_type.encode('utf-8')) & 0xFFFFFFFF
         return float(h % 10000) / 10000.0 * 2 * np.pi
 
     def code_to_graph(self, code: str = None, tree: ast.AST = None) -> nx.DiGraph:
