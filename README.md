@@ -4,89 +4,215 @@ A strictly deterministic architecture that mathematically synthesizes new code s
 
 ## Architecture
 
+### High-Level Pipeline
+
 ```
-┌─────────────────┐      ┌──────────────────┐      ┌─────────────────┐
-│   Source Code    │      │  Axiom Corpus    │      │  Novel Code     │
-│   (Python)       │      │  {c_1, ..., c_n} │      │  (Python AST)   │
-└────────┬────────┘      └────────┬─────────┘      └────────▲────────┘
-         │                        │                          │
-         ▼                        ▼                          │
-┌─────────────────┐      ┌──────────────────┐      ┌────────┴────────┐
-│   TOPOLOGY       │      │   PROJECTION      │      │   DECODER        │
-│   AST + CFG +    │─────▶│   Graph → FHRR    │─┐   │   VSA → SMT → AST│
-│   Data-Dep Graph │      │   Hypervector     │ │   │   (Z3 Solver)    │
-└─────────────────┘      └──────────────────┘ │   └────────▲────────┘
-                                               │            │
-                                               ▼            │
-                                      ┌──────────────────┐ │
-                                      │   SYNTHESIS       │─┘
-                                      │   Phase Transition│
-                                      │   bind(A_i ⊗ A_j) │
-                                      └──────────────────┘
-                                               │
-                                      ┌────────▼─────────┐
-                                      │   HDC_CORE (Rust) │
-                                      │   FHRR Arena      │
-                                      │   AVX2 SIMD       │
-                                      └──────────────────┘
+                        ╔══════════════════════════════════════╗
+                        ║         INPUT: Python Source Code     ║
+                        ╚══════════════════╤═══════════════════╝
+                                           │
+                    ┌──────────────────────┐│┌──────────────────────┐
+                    │   Corpus Ingestion   │││   Single-File Input  │
+                    │   (batch of .py)     ◄┼►   (one .py file)    │
+                    └──────────┬───────────┘│└──────────┬───────────┘
+                               └────────────┼───────────┘
+                                            ▼
+              ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+              ┃  STAGE 1: TOPOLOGY EXTRACTION                       ┃
+              ┃  Parse Python → 3-layer directed graph              ┃
+              ┃                                                     ┃
+              ┃   ┌─────────┐   ┌─────────┐   ┌──────────────┐    ┃
+              ┃   │   AST   │   │   CFG   │   │  Data-Dep    │    ┃
+              ┃   │  Layer  │   │  Layer  │   │   Layer      │    ┃
+              ┃   │(struct) │   │ (flow)  │   │ (def-use)    │    ┃
+              ┃   └────┬────┘   └────┬────┘   └──────┬───────┘    ┃
+              ┗━━━━━━━━┿━━━━━━━━━━━━┿━━━━━━━━━━━━━━━┿━━━━━━━━━━━━┛
+                       └─────────────┼───────────────┘
+                                     ▼
+              ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+              ┃  STAGE 2: FHRR PROJECTION                           ┃
+              ┃  Graph → Holographic Hypervector                    ┃
+              ┃                                                     ┃
+              ┃   AST:  bind(type ⊗ position ⊗ CA-state)           ┃
+              ┃   CFG:  chain-bind(⊗) preserving order             ┃
+              ┃   Data: bundle(⊕) preserving membership            ┃
+              ┃   Final: bind(AST_vec ⊗ CFG_vec ⊗ Data_vec)       ┃
+              ┃                                                     ┃
+              ┃   ┌─────────────────────────────────────────┐      ┃
+              ┃   │  HDC_CORE (Rust + PyO3)                 │      ┃
+              ┃   │  FHRR Arena  ·  AVX2 SIMD acceleration  │      ┃
+              ┃   └─────────────────────────────────────────┘      ┃
+              ┗━━━━━━━━━━━━━━━━━━━━┯━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+                                    │  axiom hypervectors
+                                    ▼
+              ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+              ┃  STAGE 3: SYNTHESIS                                 ┃
+              ┃  Axiom Composition → Novel Hypervector              ┃
+              ┃                                                     ┃
+              ┃   1. Pairwise resonance matrix (cosine similarity)  ┃
+              ┃   2. Maximal clique extraction (Bron-Kerbosch)      ┃
+              ┃   3. Chain-bind clique members → novel vector       ┃
+              ┃      (quasi-orthogonal to all sources)              ┃
+              ┗━━━━━━━━━━━━━━━━━━━━┯━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+                                    │  synthesized hypervector
+                                    ▼
+              ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+              ┃  STAGE 4: DECODING                                  ┃
+              ┃  Hypervector → Python Source Code                   ┃
+              ┃                                                     ┃
+              ┃   1. PROBE: correlate against atom vocabulary       ┃
+              ┃   2. ENCODE: translate atoms → Z3 formulas          ┃
+              ┃   3. SOLVE:                                         ┃
+              ┃      ┌─────────┐       ┌──────────────────┐        ┃
+              ┃      │   SAT   │──────►│  Compile → AST   │        ┃
+              ┃      └─────────┘       └──────────────────┘        ┃
+              ┃      ┌─────────┐       ┌──────────────────┐        ┃
+              ┃      │  UNSAT  │──────►│  Phase Transition │        ┃
+              ┃      └─────────┘       │  (see below)      │        ┃
+              ┃                        └──────────────────┘        ┃
+              ┗━━━━━━━━━━━━━━━━━━━━┯━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+                                    │
+                                    ▼
+                        ╔══════════════════════════════════════╗
+                        ║      OUTPUT: Novel Python Source      ║
+                        ╚══════════════════════════════════════╝
+```
 
-                         ┌──────────────────────────────────┐
-                         │   PHASE TRANSITION MECHANISMS     │
-                         │                                   │
-                         │ 1. Quotient Space Folding         │
-                         │    H → H / ⟨V_error⟩             │
-                         │ 2. Operator Fusion                │
-                         │    A ⊗ (B₁ ⊕ … ⊕ Bₖ)           │
-                         │ 3. Dimension Expansion            │
-                         │    d → 2d (conjugate reflection)  │
-                         └──────────────────────────────────┘
+### Phase Transition Cascade (UNSAT Resolution)
 
-                         ┌──────────────────────────────────┐
-                         │   BOUNDARY CARTOGRAPHY            │
-                         │                                   │
-                         │ 1. Collect V_error walls           │
-                         │ 2. Map wall resonance → cliques   │
-                         │ 3. Estimate residual dimension    │
-                         │ 4. Extract open directions        │
-                         │ 5. Synthesize along open dirs     │
-                         │ 6. Iterate until space closes     │
-                         └──────────────────────────────────┘
+```
+  UNSAT detected by Z3
+         │
+         ▼
+  ┌──────────────────────────────────────────────────────┐
+  │ PHASE 1: Quotient Space Folding (cheapest)           │
+  │                                                      │
+  │  UNSAT Core → conflicting atoms → V_error            │
+  │  Project arena: H → H / ⟨V_error⟩                   │
+  │  Re-probe + re-solve                                 │
+  └────────────────────┬─────────────────────────────────┘
+                       │ still UNSAT?
+                       ▼
+  ┌──────────────────────────────────────────────────────┐
+  │ PHASE 2: Operator Fusion                             │
+  │                                                      │
+  │  fuse(ast, [cfg, data]) = ast ⊗ (cfg ⊕ data)        │
+  │  Collapse cross-layer interference                   │
+  └────────────────────┬─────────────────────────────────┘
+                       │ still UNSAT?
+                       ▼
+  ┌──────────────────────────────────────────────────────┐
+  │ PHASE 3: Dimension Expansion (most expensive)        │
+  │                                                      │
+  │  d → 2d via conjugate reflection                     │
+  │  Rebuild vocabulary + re-probe at higher dimension   │
+  └──────────────────────────────────────────────────────┘
+```
 
-                         ┌──────────────────┐
-                         │   DISCOVERY       │
-                         │   Corpus Ingest → │
-                         │   Resonance →     │
-                         │   Clustering →    │
-                         │   Report          │
-                         └──────────────────┘
+### SERL — Closed-Loop Expansion
 
-                         ┌──────────────────────────────────┐
-                         │   SERL (Closed-Loop Expansion)    │
-                         │                                   │
-                         │ corpus → synthesize → decode →    │
-                         │ EXECUTE → EVALUATE →              │
-                         │   [fitness > θ] → REINGEST →      │
-                         │   vocab_expand → next cycle        │
-                         │                                   │
-                         │ F_eff = new_atoms / syntheses      │
-                         │ > 0 → space is open                │
-                         │ = 0 for K cycles → space closed    │
-                         └──────────────────────────────────┘
+```
+  ┌─────────────────────────────────────────────────────────────┐
+  │                                                             │
+  │   ┌───────────┐    ┌──────────┐    ┌──────────┐            │
+  │   │ SYNTHESIZE │───►│  DECODE  │───►│ EXECUTE  │            │
+  │   │ (cliques)  │    │ (Z3+AST) │    │(sandbox) │            │
+  │   └───────────┘    └──────────┘    └─────┬────┘            │
+  │         ▲                                 │                 │
+  │         │                                 ▼                 │
+  │         │                          ┌────────────┐           │
+  │         │                          │  EVALUATE   │           │
+  │         │                          │ fitness > θ? │           │
+  │         │                          └──┬──────┬──┘           │
+  │         │                    YES ◄────┘      └────► NO      │
+  │         │                     │                    (discard) │
+  │         │                     ▼                              │
+  │   ┌─────┴─────┐       ┌────────────┐                       │
+  │   │  NEXT      │◄──────│  REINGEST  │                       │
+  │   │  CYCLE     │       │  expand    │                       │
+  │   │            │       │  vocab     │                       │
+  │   └───────────┘       └────────────┘                       │
+  │                                                             │
+  │   HALT when: F_eff = 0 for K cycles (space closed)         │
+  │              OR max_cycles reached                           │
+  └─────────────────────────────────────────────────────────────┘
 
-                         ┌──────────────────────────────────┐
-                         │   SWARM (Collective Intelligence)  │
-                         │                                   │
-                         │ N agents × independent pipelines  │
-                         │ Communication: raw phase arrays    │
-                         │ Consensus: correlate_matrix +      │
-                         │   Bron-Kerbosch clique extraction  │
-                         │ UNSAT → Global Quotient Collapse   │
-                         │   (broadcast V_error to all agents)│
-                         │                                   │
-                         │ Heterogeneous corpora → diverse    │
-                         │   resonance landscapes →           │
-                         │   collective > any individual      │
-                         └──────────────────────────────────┘
+  F_eff = new_atoms / syntheses_attempted
+    > 0 → space is open    = 0 for K cycles → space is closed
+```
+
+### Swarm — Multi-Agent Collective Intelligence
+
+```
+  ┌───────────────────────────────────────────────────────────────┐
+  │                     SWARM ORCHESTRATOR                         │
+  │                                                               │
+  │  1. Collect candidate vectors (V_cand) from all agents        │
+  │  2. correlate_matrix → Bron-Kerbosch (ρ > 0.85)              │
+  │  3. Bundle clique → consensus centroid                        │
+  │  4. Decode consensus → Z3 → Python AST                       │
+  │                                                               │
+  │     SAT → sandbox → fitness gate → expand vocab               │
+  │     UNSAT → extract V_error → broadcast to ALL agents         │
+  └───────┬──────────┬──────────┬──────────┬──────────────────────┘
+          │          │          │          │
+    ┌─────▼─────┐┌───▼─────┐┌──▼──────┐┌──▼────────┐
+    │  Agent 0  ││ Agent 1 ││ Agent 2 ││ Agent N-1 │
+    │           ││         ││         ││           │
+    │  Arena    ││  Arena  ││  Arena  ││  Arena    │
+    │  Synth    ││  Synth  ││  Synth  ││  Synth    │
+    │  Decoder  ││ Decoder ││ Decoder ││  Decoder  │
+    │  SERL     ││  SERL   ││  SERL   ││  SERL     │
+    │           ││         ││         ││           │
+    │ Corpus:   ││ Corpus: ││ Corpus: ││ Corpus:   │
+    │  math/*   ││  sys/*  ││  net/*  ││ custom/*  │
+    └───────────┘└─────────┘└─────────┘└───────────┘
+
+  Key: Each agent has a DIFFERENT corpus (heterogeneity is critical).
+       Communication is via raw FHRR phase arrays — no text, no LLMs.
+```
+
+### Boundary Cartography
+
+```
+  ┌─────────────┐
+  │ Wall Archive │◄─── V_error from each UNSAT event
+  │ (persistent) │
+  └──────┬──────┘
+         │
+         ▼
+  ┌────────────────┐    ┌───────────────────┐    ┌──────────────────┐
+  │ 1. MAP         │───►│ 2. MEASURE         │───►│ 3. NAVIGATE      │
+  │ Wall resonance │    │ Residual dimension │    │ Extract top-k    │
+  │ → cliques      │    │ d_eff / d          │    │ open directions  │
+  └────────────────┘    └───────────────────┘    └────────┬─────────┘
+                                                          │
+         ┌────────────────────────────────────────────────┘
+         ▼
+  ┌────────────────┐    ┌───────────────────┐
+  │ 4. SYNTHESIZE  │───►│ 5. RECORD          │
+  │ Along open     │    │ UNSAT → new wall   │──── loop back to 1
+  │ directions     │    │ SAT   → success    │
+  └────────────────┘    └───────────────────┘
+
+  HALT when: d_eff < 0.1·d (space classified as closed)
+             OR no open directions remain
+```
+
+### Analysis & Discovery
+
+```
+  Axiom Hypervectors
+         │
+         ├──► Resonance Matrix ──► Hierarchical Clustering
+         │                    ──► Outlier Detection
+         │                    ──► Cross-Project Bridging
+         │
+         ├──► Structural Diff ──► Per-Layer Similarity (AST / CFG / Data)
+         │                   ──► Refactoring Detector
+         │                   ──► Temporal Change Classification
+         │
+         └──► Report Generator ──► JSON + Markdown
 ```
 
 ## Modules
