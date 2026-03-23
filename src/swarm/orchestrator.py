@@ -21,6 +21,7 @@ Each round:
 """
 
 import logging
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -373,14 +374,19 @@ class SwarmOrchestrator:
         )
 
     def _collect_candidates(self) -> List[PhaseMessage]:
-        """Run local synthesis on all agents, collect emitted candidates.
+        """Run local synthesis on all agents in parallel, collect emitted candidates.
 
-        Sequential execution: agent 0 runs, then agent 1, etc.
+        Uses ProcessPoolExecutor to run each agent's synthesis concurrently.
         """
         all_candidates: List[PhaseMessage] = []
-        for agent in self.agents:
-            candidates = agent.run_local_synthesis(max_cliques=10)
-            all_candidates.extend(candidates)
+        with ProcessPoolExecutor(max_workers=len(self.agents)) as executor:
+            futures = {
+                executor.submit(agent.run_local_synthesis, max_cliques=10): agent
+                for agent in self.agents
+            }
+            for future in as_completed(futures):
+                candidates = future.result()
+                all_candidates.extend(candidates)
         return all_candidates
 
     def _broadcast_wall_targeted(

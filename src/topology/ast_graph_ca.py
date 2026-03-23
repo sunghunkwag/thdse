@@ -1,5 +1,4 @@
 import ast
-import hashlib
 import networkx as nx
 import numpy as np
 
@@ -8,7 +7,7 @@ class TopologicalASTGraphCA:
         self.steps = steps
 
     def get_node_seed(self, node_type: str) -> float:
-        h = int(hashlib.md5(node_type.encode('utf-8')).hexdigest()[:8], 16)
+        h = hash(node_type) & 0xFFFFFFFF
         return float(h % 10000) / 10000.0 * 2 * np.pi
 
     def code_to_graph(self, code: str = None, tree: ast.AST = None) -> nx.DiGraph:
@@ -54,7 +53,7 @@ class TopologicalASTGraphCA:
                 child_msg = sum(G.nodes[c]['state'] for c in children) if children else 0
                 
                 agg = state + 0.5 * parent_msg + 0.5 * child_msg
-                if np.abs(agg) == 0:
+                if np.isclose(np.abs(agg), 0, atol=1e-8):
                     agg = 1.0 + 0j
                 
                 new_phase = np.angle(agg)
